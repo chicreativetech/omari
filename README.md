@@ -1,2 +1,2 @@
 # Omari
-A plugin form Omarchy that adds Niri-like functionality
+A plugin for Omarchy that adds Niri-like functionality
