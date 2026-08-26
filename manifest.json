@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "bergdahlchi.omari",
+  "name": "Omari",
+  "version": "1.0.0",
+  "author": "bergdahlchi",
+  "license": "MIT",
+  "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, and column-aware focus).",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omari",
+    "description": "Toggle Omari mode: niri-like scrolling layout, 3-finger swipe, and column-aware focus (SUPER+arrows).",
+    "category": "Window management",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

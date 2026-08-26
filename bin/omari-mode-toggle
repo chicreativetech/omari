@@ -1,0 +1,17 @@
+#!/bin/bash
+# Toggles Omari mode (the niri-like scrolling-layout mode) on/off and
+# reloads Hyprland. Same copy-into-toggles-dir pattern as
+# omarchy-hyprland-toggle, just sourced from the user's own
+# ~/.config/hypr/omari-mode.lua instead of a package file.
+
+SOURCE="$HOME/.config/hypr/omari-mode.lua"
+FLAG_FILE="$HOME/.local/state/omarchy/toggles/hypr/omari-mode.lua"
+
+if [[ -f "$FLAG_FILE" ]]; then
+  rm -f "$FLAG_FILE"
+else
+  mkdir -p "$(dirname "$FLAG_FILE")"
+  cp "$SOURCE" "$FLAG_FILE"
+fi
+
+hyprctl reload >/dev/null
