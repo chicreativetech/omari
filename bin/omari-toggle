@@ -59,6 +59,11 @@ on() {
   local tmp
   tmp="$(mktemp "$(dirname "$FLAG_FILE")/.omari-$NAME.XXXXXX")"
   cp "$SOURCE" "$tmp"
+  # mktemp creates 0600 and the rename carries that over, which would leave
+  # the flag file more restrictive than the plain `cp` this replaced. Nothing
+  # reads it but this user's Hyprland, so the mode is cosmetic -- but a
+  # toggles directory where one file looks different invites a second look.
+  chmod 644 "$tmp"
   mv -f "$tmp" "$FLAG_FILE"
 }
 
