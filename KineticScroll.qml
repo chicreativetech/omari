@@ -30,12 +30,34 @@ Item {
   property real restPosition: 0
 
   // ---- feel ----
+  // Touchpad drags arrive already scaled by Hyprland's global
+  // input.touchpad.scroll_factor (Omarchy default: 0.4, i.e. 40% of the raw
+  // finger travel) before this component ever sees a pixelDelta. That's the
+  // right feel for scrolling ordinary window content, which is what the
+  // setting is tuned for, but it makes a dedicated scroll surface like this
+  // one feel sluggish under the same fingers. Terminals hit the identical
+  // problem and Omarchy compensates per-window with a `scroll_touchpad`
+  // window rule (see hypr/input.lua) -- not available here since this is a
+  // layer-shell surface, not a tracked window, so dragScale compensates
+  // directly in dragBy() instead.
+  property real dragScale: 1
   property real notchPixels: 110    // travel per discrete mouse-wheel notch
-  property real deceleration: 1500  // px/s^2, momentum decay
-  property real maxVelocity: 9000   // px/s, cap on a flick
-  property real minVelocity: 40     // px/s, below this momentum has stopped
-  property real bandTau: 0.085      // s, rubber-band spring time constant
-  property real glideTau: 0.070     // s, discrete-wheel glide time constant
+  // Momentum decay is exponential (velocity loses a fraction of itself per
+  // unit time, like the glide/band eases below) rather than the constant
+  // px/s^2 this used to subtract every frame. Constant deceleration keeps
+  // full braking force right up to the moment it snaps to a stop, which
+  // reads as abrupt; decaying proportional to the current speed brakes hard
+  // while fast and tapers off the harder it already slowed, so the coast
+  // eases out instead of cutting off.
+  property real momentumTau: 1.6    // s, momentum decay time constant
+  property real maxVelocity: 18000  // px/s, cap on a flick
+  property real minVelocity: 25     // px/s, below this momentum has stopped
+  // bandTau doubles as the edge spring's stiffness (w = 1/bandTau below): the
+  // old 0.085s made for a very stiff, tightly-wound spring that snapped back
+  // rigidly the instant a drag or flick went past an edge. A longer time
+  // constant is a softer spring -- more give, a gentler settle.
+  property real bandTau: 0.35       // s, rubber-band spring time constant
+  property real glideTau: 0.18      // s, discrete-wheel glide time constant
 
   // ---- state out ----
 
@@ -86,7 +108,7 @@ Item {
     // Fingers are back down; whatever the last gesture left coasting is over.
     root.stop()
 
-    var d = delta
+    var d = delta * root.dragScale
     var over = root.edgeFor(root.position)
     // Past an edge the content follows the fingers less and less the further
     // out it goes, so the end of the list feels like something you can lean
@@ -212,8 +234,8 @@ Item {
       }
 
       root.position += root.velocity * dt
-      var decay = root.deceleration * dt
-      root.velocity -= Math.sign(root.velocity) * Math.min(Math.abs(root.velocity), decay)
+      var km = 1 - Math.exp(-dt / root.momentumTau)
+      root.velocity -= root.velocity * km
 
       // Crossing an edge under momentum: bleed most of the speed on the way
       // out so the bounce is a nod, not a lunge. The spring branch above

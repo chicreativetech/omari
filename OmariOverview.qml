@@ -182,8 +182,29 @@ Item {
     return arr
   }
 
+  // Dispatches through Hyprland itself (hl.dsp.focus({ window = ... })),
+  // rather than the generic wlr-foreign-toplevel activate() request that
+  // used to run here: activate() only asks for keyboard focus and leaves it
+  // up to the compositor whether that also raises the window's workspace,
+  // and doing it while this overlay still holds exclusive keyboard focus
+  // (WlrKeyboardFocus.Exclusive above) races root.close() unmapping that
+  // same surface. Hyprland's own focus dispatcher switches the active
+  // workspace to the window's as an intrinsic part of focusing it, so this
+  // reaches both the app and its workspace deterministically.
+  //
+  // Shells out to `hyprctl dispatch` (via Util.execArgv) instead of calling
+  // Quickshell's own Hyprland.dispatch() QML method: that method silently
+  // has no effect here, most likely because it still speaks Hyprland's
+  // pre-0.55 two-part "dispatch <name> <args>" wire format, while 0.55+
+  // parses `hyprctl dispatch <arg>` as a Lua expression fed to hl.dispatch()
+  // -- exactly what this line sends. `hyprctl dispatch` itself was verified
+  // directly against a live window and does switch focus + workspace.
   function focusToplevel(hyprlandToplevel) {
-    if (hyprlandToplevel && hyprlandToplevel.wayland) hyprlandToplevel.wayland.activate()
+    var ipc = hyprlandToplevel && hyprlandToplevel.lastIpcObject
+    var address = ipc ? ipc.address : undefined
+    if (address) {
+      Util.execArgv(["hyprctl", "dispatch", "hl.dsp.focus({ window = 'address:" + address + "' })"])
+    }
     root.close()
   }
 
@@ -205,7 +226,12 @@ Item {
 
     Rectangle {
       anchors.fill: parent
-      color: Color.background
+      // Darker than the theme's flat Color.background so the overview's own
+      // backdrop recedes behind the thumbnails' live app colors and the
+      // wallpaper, instead of competing with them at the same tone. Slightly
+      // transparent so a hint of the real desktop underneath still shows
+      // through instead of a flat, opaque wall.
+      color: Util.alpha(Qt.darker(Color.background, 2.2), 0.9)
     }
 
     MouseArea {
@@ -273,6 +299,10 @@ Item {
           contentSize: column.height
           restPosition: viewport.centeredPosition
           notchPixels: root.rowStride * 0.55
+          // Undoes Hyprland's global touchpad scroll_factor (Omarchy
+          // default 0.4) -- see the property's own comment in
+          // KineticScroll.qml.
+          dragScale: 4
         }
 
         Column {
@@ -431,6 +461,10 @@ Item {
                   contentSize: rowContent.width
                   restPosition: rowItem.focusedCenterX - rowViewport.width / 2
                   notchPixels: root.rowHeight * 0.6
+                  // Undoes Hyprland's global touchpad scroll_factor (Omarchy
+                  // default 0.4) -- see the property's own comment in
+                  // KineticScroll.qml.
+                  dragScale: 4
                 }
 
                 Row {
@@ -462,7 +496,12 @@ Item {
                       height: root.rowHeight
                       radius: Style.space(6)
                       color: Color.background
-                      border.width: hoverArea.containsMouse ? 2 : 1
+                      // 3px on hover, not 2: the live capture below sits
+                      // right up to this same edge (anchors.fill, inset only
+                      // by the margin fixed below), so anything short of a
+                      // clearly wider ring reads as noise against the video
+                      // rather than a highlight.
+                      border.width: hoverArea.containsMouse ? 3 : 1
                       border.color: hoverArea.containsMouse
                         ? Color.accent
                         : Util.alpha(Color.foreground, 0.15)
@@ -473,6 +512,14 @@ Item {
                       ScreencopyView {
                         id: capture
                         anchors.fill: parent
+                        // Without this inset the capture paints edge-to-edge
+                        // over the border above, in both states -- hover was
+                        // firing correctly (containsMouse, the click, the
+                        // border binding all worked) but the video was
+                        // visually covering the ring the whole time. 3
+                        // matches the hover border width so the frame reads
+                        // the same size whether or not it's covering video.
+                        anchors.margins: 3
                         captureSource: thumb.modelData.wayland
                         // Live only while this row is at or near the
                         // viewport. Every thumbnail is its own screencopy
