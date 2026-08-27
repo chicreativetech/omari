@@ -54,14 +54,26 @@ Item {
     if (!statusProbe.running) statusProbe.start()
   }
 
-  function toggle() {
+  // Ask for a specific state rather than a flip. `enabled` is false until the
+  // first status probe lands, so anything arriving in that window -- the IPC
+  // enable/disable methods, most of all -- would flip away from the default
+  // and turn a config off when it was asked to turn it on. The script's `on`
+  // and `off` actions are idempotent, so naming the state we want is always
+  // safe, whatever this side happens to believe right now.
+  function apply(target) {
     if (busy) return
     busy = true
     toggleError = ""
-    // Flip immediately so the switch tracks the click, then let the script's
-    // own answer correct it. The script is the authority on the real state.
-    enabled = !enabled
-    toggleProcess.start()
+    // Move the switch immediately so it tracks the click, then let the
+    // script's own answer correct it. The script is the authority.
+    enabled = target
+    toggleProcess.start(target ? "on" : "off")
+  }
+
+  // The switch in the popup: the user is acting on the state they can see, so
+  // flipping what we are showing is the right request to send.
+  function toggle() {
+    apply(!enabled)
   }
 
   // `exited` and `onStreamFinished` have no guaranteed order, so no single
@@ -140,9 +152,10 @@ Item {
 
   Process {
     id: toggleProcess
-    command: root.toggleCommand.concat(["toggle"])
 
-    function start() {
+    // Set in start() rather than bound, because the action varies per call.
+    function start(action) {
+      command = root.toggleCommand.concat([action])
       toggleState.out = ""
       toggleState.err = ""
       toggleState.code = -1

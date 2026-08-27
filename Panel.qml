@@ -61,9 +61,12 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function status(): string { return modeFlag.enabled ? "on" : "off" }
-    function enable(): string { if (!modeFlag.enabled) modeFlag.toggle(); return "on" }
-    function disable(): string { if (modeFlag.enabled) modeFlag.toggle(); return "off" }
+    // Name the state instead of asking modeFlag to flip: `enabled` is false
+    // until the first status probe answers, and a caller landing in that
+    // window used to make enable() turn the mode off. apply() is idempotent.
+    function status(): string { return !modeFlag.loaded ? "unknown" : (modeFlag.enabled ? "on" : "off") }
+    function enable(): string { modeFlag.apply(true); return "on" }
+    function disable(): string { modeFlag.apply(false); return "off" }
   }
 
   BarIconButton {
