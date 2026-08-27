@@ -6,11 +6,16 @@ import qs.Commons
 import qs.Ui
 
 // Omari: niri-like scrollable tiling for Omarchy. Bar icon + popup that
-// explains what the mode does and carries a single on/off switch. The
-// actual mode lives in ~/.config/hypr/omari-mode.lua (Hyprland's scrolling
-// layout + 3-finger swipe + column-aware SUPER+arrows); this panel only
-// toggles it via ~/.config/omarchy/bar/scripts/omari-mode-toggle, which
-// flips ~/.local/state/omarchy/toggles/hypr/omari-mode.lua and reloads.
+// explains what the mode does and carries two independent on/off switches:
+// the scrolling-layout mode, and the niri-style overview. The scrolling mode
+// lives in ~/.config/hypr/omari-mode.lua (Hyprland's scrolling layout +
+// 3-finger swipe + column-aware SUPER+arrows); the overview's gesture lives
+// in ~/.config/hypr/omari-overview.lua (4-finger swipe up) and its screen
+// lives in Overview.qml, this plugin's "overlay" entry point. This panel
+// only flips their toggle flags via
+// ~/.config/omarchy/bar/scripts/omari-mode-toggle and
+// ~/.config/omarchy/bar/scripts/omari-overview-toggle, which copy/remove
+// ~/.local/state/omarchy/toggles/hypr/omari-{mode,overview}.lua and reload.
 Panel {
   id: root
   moduleName: "bergdahlchi.omari"
@@ -20,69 +25,31 @@ Panel {
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-  readonly property color iconColor: omari.enabled ? foreground : dim
-  readonly property color barIconColor: omari.enabled ? barForeground : Qt.darker(barForeground, 1.55)
-  readonly property string toggleHint: omari.enabled ? "Turn Omari mode off" : "Turn Omari mode on"
-  readonly property string statusText: !omari.loaded ? "Checking status…" : (omari.enabled ? "Omari mode is on" : "Omari mode is off")
+  readonly property color iconColor: modeFlag.enabled ? foreground : dim
+  readonly property color barIconColor: modeFlag.enabled ? barForeground : Qt.darker(barForeground, 1.55)
+  readonly property string modeToggleHint: modeFlag.enabled ? "Turn Omari mode off" : "Turn Omari mode on"
+  readonly property string overviewToggleHint: overviewFlag.enabled ? "Turn the overview swipe off" : "Turn the overview swipe on"
+  readonly property string statusText: !modeFlag.loaded ? "Checking status…" : (modeFlag.enabled ? "Omari mode is on" : "Omari mode is off")
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: if (opened) {
-    omari.refresh()
+    modeFlag.refresh()
+    overviewFlag.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  // Owns the on/off state: polls the toggle flag file's presence and shells
-  // out to the toggle script, same "flip a file, reload" contract the
-  // script and omari-mode.lua already use.
-  Item {
-    id: omari
+  ToggleFlag {
+    id: modeFlag
+    flagPath: "$HOME/.local/state/omarchy/toggles/hypr/omari-mode.lua"
+    toggleScript: "$HOME/.config/omarchy/bar/scripts/omari-mode-toggle"
+  }
 
-    property bool enabled: false
-    property bool loaded: false
-    property bool busy: false
-
-    function refresh() {
-      if (!statusProbe.running) statusProbe.running = true
-    }
-
-    function toggleOmari() {
-      if (busy) return
-      busy = true
-      enabled = !enabled
-      toggleProcess.running = true
-    }
-
-    Process {
-      id: statusProbe
-      command: ["bash", "-lc", "test -f \"$HOME/.local/state/omarchy/toggles/hypr/omari-mode.lua\" && echo on || echo off"]
-      stdout: StdioCollector {
-        waitForEnd: true
-        onStreamFinished: {
-          omari.enabled = text.trim() === "on"
-          omari.loaded = true
-        }
-      }
-    }
-
-    Process {
-      id: toggleProcess
-      command: ["bash", "-lc", "\"$HOME/.config/omarchy/bar/scripts/omari-mode-toggle\""]
-      onExited: {
-        omari.busy = false
-        omari.refresh()
-      }
-    }
-
-    Timer {
-      interval: 5000
-      running: true
-      repeat: true
-      onTriggered: omari.refresh()
-    }
-
-    Component.onCompleted: refresh()
+  ToggleFlag {
+    id: overviewFlag
+    flagPath: "$HOME/.local/state/omarchy/toggles/hypr/omari-overview.lua"
+    toggleScript: "$HOME/.config/omarchy/bar/scripts/omari-overview-toggle"
   }
 
   IpcHandler {
@@ -92,9 +59,9 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function status(): string { return omari.enabled ? "on" : "off" }
-    function enable(): string { if (!omari.enabled) omari.toggleOmari(); return "on" }
-    function disable(): string { if (omari.enabled) omari.toggleOmari(); return "off" }
+    function status(): string { return modeFlag.enabled ? "on" : "off" }
+    function enable(): string { if (!modeFlag.enabled) modeFlag.toggle(); return "on" }
+    function disable(): string { if (modeFlag.enabled) modeFlag.toggle(); return "off" }
   }
 
   BarIconButton {
@@ -111,8 +78,8 @@ Panel {
       }
     }
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.RightButton) omari.toggleOmari()
-      else if (buttonCode === Qt.MiddleButton) omari.refresh()
+      if (buttonCode === Qt.RightButton) modeFlag.toggle()
+      else if (buttonCode === Qt.MiddleButton) { modeFlag.refresh(); overviewFlag.refresh() }
       else root.toggle()
     }
   }
@@ -130,11 +97,12 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onActivateRequested: omari.toggleOmari()
+      onActivateRequested: modeFlag.toggle()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "o" || t === "O") omari.toggleOmari()
+        if (t === "o" || t === "O") modeFlag.toggle()
+        else if (t === "v" || t === "V") overviewFlag.toggle()
       }
 
       Column {
@@ -149,7 +117,7 @@ Panel {
           meta: root.statusText
           foreground: root.foreground
           fontFamily: root.fontFamily
-          iconOpacity: omari.enabled ? 1.0 : 0.5
+          iconOpacity: modeFlag.enabled ? 1.0 : 0.5
           iconComponent: Component {
             OmariIcon {
               iconSize: Style.font.display
@@ -175,17 +143,49 @@ Panel {
           id: modeToggle
           width: parent.width
           label: "Enable Omari mode"
-          checked: omari.enabled
+          checked: modeFlag.enabled
           foreground: root.foreground
           fontFamily: root.fontFamily
-          onClicked: omari.toggleOmari()
+          onClicked: modeFlag.toggle()
           onHovered: function(isHovered) { modeToggle.isHovering = isHovered }
 
           property bool isHovering: false
 
           PanelToolTip {
             visible: modeToggle.isHovering
-            text: root.toggleHint
+            text: root.modeToggleHint
+            fontFamily: root.fontFamily
+          }
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        Text {
+          width: parent.width
+          text: "The overview shows every workspace as a row of live window thumbnails, niri-style — scroll down for more workspaces, click a thumbnail to jump to it. Swipe up with 4 fingers to open it, again (or Escape) to close it."
+          wrapMode: Text.WordWrap
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Toggle {
+          id: overviewToggle
+          width: parent.width
+          label: "Enable overview (4-finger swipe up)"
+          checked: overviewFlag.enabled
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: overviewFlag.toggle()
+          onHovered: function(isHovered) { overviewToggle.isHovering = isHovered }
+
+          property bool isHovering: false
+
+          PanelToolTip {
+            visible: overviewToggle.isHovering
+            text: root.overviewToggleHint
             fontFamily: root.fontFamily
           }
         }

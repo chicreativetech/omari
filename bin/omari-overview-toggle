@@ -1,0 +1,17 @@
+#!/bin/bash
+# Toggles the Omari overview gesture (4-finger swipe up, niri-style "all
+# apps" overview) on/off and reloads Hyprland. Same copy-into-toggles-dir
+# pattern as omari-mode-toggle, just sourced from the user's own
+# ~/.config/hypr/omari-overview.lua instead of a package file.
+
+SOURCE="$HOME/.config/hypr/omari-overview.lua"
+FLAG_FILE="$HOME/.local/state/omarchy/toggles/hypr/omari-overview.lua"
+
+if [[ -f "$FLAG_FILE" ]]; then
+  rm -f "$FLAG_FILE"
+else
+  mkdir -p "$(dirname "$FLAG_FILE")"
+  cp "$SOURCE" "$FLAG_FILE"
+fi
+
+hyprctl reload >/dev/null
