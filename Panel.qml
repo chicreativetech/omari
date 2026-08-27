@@ -96,8 +96,14 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(340))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    // No height cap. The cap used to be space(420), which fit the popup back
+    // when it explained one switch; the overview's paragraph and switch pushed
+    // the column past it and the bottom of the content was simply clipped.
+    // fittedContentHeight already limits the card to what fits on screen, so
+    // asking for the column's own height is both enough and self-adjusting --
+    // there is nothing here whose height a fixed number could track.
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -189,7 +195,7 @@ Panel {
         Toggle {
           id: overviewToggle
           width: parent.width
-          label: "Enable overview (4-finger swipe up)"
+          label: "Enable overview"
           checked: overviewFlag.enabled
           foreground: root.foreground
           fontFamily: root.fontFamily

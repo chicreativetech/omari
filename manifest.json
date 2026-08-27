@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bergdahlchi.omari",
   "name": "Omari",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "bergdahlchi",
   "license": "MIT",
   "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, column-aware focus) plus a niri-style overview opened with a 4-finger swipe up.",
