@@ -26,6 +26,21 @@ hl.config({
 -- than in input.lua.
 hl.gesture({ fingers = 3, direction = "horizontal", action = "scroll_move" })
 
+-- The "workspace" gesture action isn't a compositor-wide default -- it only
+-- exists where something registers it with hl.gesture. Nothing else in this
+-- config does, so claiming the horizontal 3-finger swipe above for
+-- scroll_move left vertical 3-finger swipes with no gesture to run at all,
+-- silently killing workspace switching while this mode is on. Register it
+-- explicitly so switching still works alongside the tape scroll.
+hl.gesture({ fingers = 3, direction = "vertical", action = "workspace" })
+
+-- Omarchy ships the "workspaces" animation leaf disabled (instant switch,
+-- no slide) since its default SUPER+number switching has no swipe direction
+-- to match. Now that switching is a vertical swipe, the switch should
+-- animate along that same axis -- same style/speed/bezier Omarchy already
+-- uses for the (also vertical-swipe-driven) specialWorkspace animation.
+hl.animation({ leaf = "workspaces", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert" })
+
 -- Omarchy's default SUPER+arrows use hl.dsp.focus({direction=...}), the
 -- classic movefocus dispatcher. It no-ops when the active column is
 -- fullscreened/maximized ("Full width", SUPER+ALT+F) -- it won't move to
