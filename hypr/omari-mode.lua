@@ -1,13 +1,11 @@
--- Omari mode: niri-like scrolling-layout mode. A single, portable file: copy
--- it to ~/.config/hypr/omari-mode.lua on another machine to reuse it there.
+-- Omari mode: niri-like scrolling-layout mode.
 --
--- This file is NOT loaded directly. Toggling copies it into
+-- This file is NOT loaded directly, and does not need to be copied anywhere.
+-- It ships inside the Omari plugin directory; turning the mode on (the bar
+-- popup's switch, or bin/omari-toggle mode on) copies it into
 -- ~/.local/state/omarchy/toggles/hypr/omari-mode.lua, a directory Omarchy's
 -- default toggle loader (default.hypr.toggles, required from hyprland.lua)
 -- already sources on every reload -- see /usr/share/omarchy/default/hypr/toggles.lua.
---
--- Toggle it with: ~/.config/omarchy/bar/scripts/omari-mode-toggle
--- (also wired to the Omari bar plugin, ~/.config/omarchy/plugins/bergdahlchi.omari/).
 
 hl.config({
   general = {

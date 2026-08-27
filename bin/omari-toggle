@@ -1,0 +1,91 @@
+#!/bin/bash
+# Turns one of Omari's Hyprland configs on or off and reloads Hyprland.
+#
+#   omari-toggle <mode|overview> [on|off|toggle|status]
+#
+# The lua sources live next to this script, inside the plugin directory, and
+# this script finds them relative to itself. Installing the plugin is therefore
+# the whole install: nothing has to be copied into ~/.config/hypr or
+# ~/.config/omarchy/bar/scripts first, and flipping a switch in the bar applies
+# the config on a machine that has never seen Omari before.
+#
+# Turning one on copies its source into
+# ~/.local/state/omarchy/toggles/hypr/omari-<name>.lua, the directory Omarchy's
+# default toggle loader sources on every reload -- the same contract
+# omarchy-hyprland-toggle uses for Omarchy's own flags, just sourced from the
+# plugin instead of $OMARCHY_PATH.
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: omari-toggle <mode|overview> [on|off|toggle|status]" >&2
+}
+
+if (($# < 1)); then
+  usage
+  exit 1
+fi
+
+NAME="$1"
+ACTION="${2:-toggle}"
+
+case $NAME in
+  mode | overview) ;;
+  *)
+    echo "Unknown Omari config: $NAME" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+# BASH_SOURCE rather than $0: this is also run as `bash <path>/omari-toggle`,
+# where the plugin directory may have lost its executable bits (a zip download,
+# a copy across filesystems), and $0 is then the path bash was handed anyway.
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+SOURCE="$PLUGIN_DIR/hypr/omari-$NAME.lua"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+FLAG_FILE="$STATE_HOME/omarchy/toggles/hypr/omari-$NAME.lua"
+
+on() {
+  if [[ ! -f $SOURCE ]]; then
+    echo "Missing $SOURCE -- the plugin install is incomplete." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$FLAG_FILE")"
+  # Copy to a temp file in the destination directory and rename it into place,
+  # so a reload triggered while the copy is in flight never sources a half
+  # written lua file.
+  local tmp
+  tmp="$(mktemp "$(dirname "$FLAG_FILE")/.omari-$NAME.XXXXXX")"
+  cp "$SOURCE" "$tmp"
+  mv -f "$tmp" "$FLAG_FILE"
+}
+
+off() {
+  rm -f "$FLAG_FILE"
+}
+
+case $ACTION in
+  on) on ;;
+  off) off ;;
+  status)
+    [[ -f $FLAG_FILE ]] && echo "on" || echo "off"
+    exit 0
+    ;;
+  toggle)
+    if [[ -f $FLAG_FILE ]]; then off; else on; fi
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
+# A reload is what actually applies the change. Hyprland not running (the shell
+# under a nested session, a reload racing a compositor restart) is not a reason
+# to report the toggle itself as failed -- the flag file is already correct and
+# the next reload picks it up.
+hyprctl reload >/dev/null 2>&1 || echo "Config written, but 'hyprctl reload' failed." >&2
+
+[[ -f $FLAG_FILE ]] && echo "on" || echo "off"

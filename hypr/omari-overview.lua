@@ -2,18 +2,15 @@
 -- up or SUPER+ALT+O. Every workspace becomes a row, windows in that
 -- workspace laid out side by side as thumbnails; scroll down for more
 -- workspaces. Swipe/press again, click the background, or press Escape to
--- close it. A single, portable
--- file: copy it to ~/.config/hypr/omari-overview.lua on another machine to
--- reuse it there.
+-- close it.
 --
--- This file is NOT loaded directly. Toggling copies it into
+-- This file is NOT loaded directly, and does not need to be copied anywhere.
+-- It ships inside the Omari plugin directory; turning the overview on (the
+-- bar popup's switch, or bin/omari-toggle overview on) copies it into
 -- ~/.local/state/omarchy/toggles/hypr/omari-overview.lua, a directory
 -- Omarchy's default toggle loader (default.hypr.toggles, required from
 -- hyprland.lua) already sources on every reload -- see
 -- /usr/share/omarchy/default/hypr/toggles.lua.
---
--- Toggle it with: ~/.config/omarchy/bar/scripts/omari-overview-toggle
--- (also wired to the Omari bar plugin, ~/.config/omarchy/plugins/bergdahlchi.omari/).
 
 hl.gesture({
   fingers = 4,

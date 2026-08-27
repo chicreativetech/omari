@@ -8,14 +8,16 @@ import qs.Ui
 // Omari: niri-like scrollable tiling for Omarchy. Bar icon + popup that
 // explains what the mode does and carries two independent on/off switches:
 // the scrolling-layout mode, and the niri-style overview. The scrolling mode
-// lives in ~/.config/hypr/omari-mode.lua (Hyprland's scrolling layout +
-// 3-finger swipe + column-aware SUPER+arrows); the overview's gesture lives
-// in ~/.config/hypr/omari-overview.lua (4-finger swipe up) and its screen
-// lives in OmariOverview.qml, this plugin's "overlay" entry point. This panel
-// only flips their toggle flags via
-// ~/.config/omarchy/bar/scripts/omari-mode-toggle and
-// ~/.config/omarchy/bar/scripts/omari-overview-toggle, which copy/remove
-// ~/.local/state/omarchy/toggles/hypr/omari-{mode,overview}.lua and reload.
+// is hypr/omari-mode.lua (Hyprland's scrolling layout + 3-finger swipe +
+// column-aware SUPER+arrows); the overview's gesture is hypr/omari-overview.lua
+// (4-finger swipe up) and its screen is OmariOverview.qml, this plugin's
+// "overlay" entry point.
+//
+// Both lua files ship inside this plugin directory, and each switch runs
+// bin/omari-toggle out of that same directory to copy one into
+// ~/.local/state/omarchy/toggles/hypr/ and reload Hyprland. Installing the
+// plugin is therefore the entire install -- see ToggleFlag.qml, which owns
+// one switch's state and locates the script.
 Panel {
   id: root
   moduleName: "bergdahlchi.omari"
@@ -29,7 +31,9 @@ Panel {
   readonly property color barIconColor: modeFlag.enabled ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property string modeToggleHint: modeFlag.enabled ? "Turn Omari mode off" : "Turn Omari mode on"
   readonly property string overviewToggleHint: overviewFlag.enabled ? "Turn the overview swipe off" : "Turn the overview swipe on"
-  readonly property string statusText: !modeFlag.loaded ? "Checking status…" : (modeFlag.enabled ? "Omari mode is on" : "Omari mode is off")
+  readonly property string statusText: modeFlag.error !== "" ? "Omari mode is unavailable"
+    : !modeFlag.loaded ? "Checking status…"
+    : (modeFlag.enabled ? "Omari mode is on" : "Omari mode is off")
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -42,14 +46,12 @@ Panel {
 
   ToggleFlag {
     id: modeFlag
-    flagPath: "$HOME/.local/state/omarchy/toggles/hypr/omari-mode.lua"
-    toggleScript: "$HOME/.config/omarchy/bar/scripts/omari-mode-toggle"
+    flagName: "mode"
   }
 
   ToggleFlag {
     id: overviewFlag
-    flagPath: "$HOME/.local/state/omarchy/toggles/hypr/omari-overview.lua"
-    toggleScript: "$HOME/.config/omarchy/bar/scripts/omari-overview-toggle"
+    flagName: "overview"
   }
 
   IpcHandler {
@@ -158,6 +160,16 @@ Panel {
           }
         }
 
+        Text {
+          width: parent.width
+          visible: modeFlag.error !== ""
+          text: modeFlag.error
+          wrapMode: Text.WordWrap
+          color: Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
         PanelSeparator {
           foreground: root.foreground
         }
@@ -188,6 +200,16 @@ Panel {
             text: root.overviewToggleHint
             fontFamily: root.fontFamily
           }
+        }
+
+        Text {
+          width: parent.width
+          visible: overviewFlag.error !== ""
+          text: overviewFlag.error
+          wrapMode: Text.WordWrap
+          color: Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
         }
       }
     }

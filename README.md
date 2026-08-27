@@ -63,47 +63,53 @@ Wayland buffer traffic competing with the frames a smooth scroll needs.
 
 ## Install
 
-1. Copy the Quickshell plugin into your user plugins directory (pick your
-   own id, e.g. `<username>.omari`):
+The plugin directory is the whole install — the Hyprland config and the
+script that applies it ship inside it, so there is nothing to copy into
+`~/.config/hypr` or `~/.config/omarchy/bar/scripts`.
 
-   ```bash
-   mkdir -p ~/.config/omarchy/plugins/<username>.omari
-   cp manifest.json Panel.qml OmariOverview.qml KineticScroll.qml \
-     ToggleFlag.qml OmariIcon.qml \
-     ~/.config/omarchy/plugins/<username>.omari/
-   ```
+```bash
+git clone https://github.com/chicreativetech/omari.git \
+  ~/.config/omarchy/plugins/bergdahlchi.omari
+omarchy-shell shell rescanPlugins
+omarchy plugin enable bergdahlchi.omari --section left
+```
 
-   Edit `id` in `manifest.json` to match the directory name if you change it.
+Then click the Omari icon in the bar and turn on whichever switches you
+want. Each one writes its config and reloads Hyprland for you; nothing else
+has to be set up first.
 
-2. Copy the Hyprland mode/overview files and the toggle scripts:
+To install under a different id, rename the directory and change `id` in
+`manifest.json` to match — and also the two `bergdahlchi.omari` references in
+`hypr/omari-overview.lua`, which is what the swipe and `SUPER+ALT+O` summon.
 
-   ```bash
-   cp hypr/omari-mode.lua ~/.config/hypr/omari-mode.lua
-   cp hypr/omari-overview.lua ~/.config/hypr/omari-overview.lua
-   cp bin/omari-mode-toggle ~/.config/omarchy/bar/scripts/omari-mode-toggle
-   cp bin/omari-overview-toggle ~/.config/omarchy/bar/scripts/omari-overview-toggle
-   chmod +x ~/.config/omarchy/bar/scripts/omari-mode-toggle \
-     ~/.config/omarchy/bar/scripts/omari-overview-toggle
-   ```
+## Uninstall
 
-3. Rescan and enable the plugin:
+Turn both switches off (that removes the Hyprland config and reloads), then:
 
-   ```bash
-   omarchy-shell shell rescanPlugins
-   omarchy plugin enable <username>.omari --section left
-   ```
+```bash
+omarchy plugin disable bergdahlchi.omari
+rm -rf ~/.config/omarchy/plugins/bergdahlchi.omari
+```
 
 ## How it works
 
 - `hypr/omari-mode.lua` and `hypr/omari-overview.lua` are not loaded
-  directly. Toggling one copies it into
+  directly. Turning one on copies it into
   `~/.local/state/omarchy/toggles/hypr/omari-{mode,overview}.lua`, a
   directory Omarchy's default toggle loader already sources on every
-  Hyprland reload.
-- `bin/omari-mode-toggle` and `bin/omari-overview-toggle` flip their flag
-  file's presence and run `hyprctl reload`. `ToggleFlag.qml` is the shared
-  state machine Panel.qml instantiates once per mode: it polls the flag
-  file's presence and runs the toggle script.
+  Hyprland reload — the same contract `omarchy-hyprland-toggle` uses for
+  Omarchy's own flags, just sourced from the plugin instead of
+  `$OMARCHY_PATH`.
+- `bin/omari-toggle <mode|overview> [on|off|toggle|status]` is what does
+  that. It finds the lua sources relative to its own path, which is what
+  makes the plugin directory self-contained: an install that has never seen
+  Omari before can apply the config from the switch alone. `ToggleFlag.qml`
+  is the state machine `Panel.qml` instantiates once per switch; it resolves
+  the plugin directory from its own QML url and runs the script out of it.
+- The script is run as `bash <path>/omari-toggle` rather than executed
+  directly, so a plugin directory that arrived without its executable bits
+  still works. A failure now surfaces in the popup instead of the switch
+  silently flipping back.
 - `omari-overview.lua` binds both a 4-finger swipe up and `SUPER+ALT+O` to
   `omarchy-shell shell toggle bergdahlchi.omari`. Because the manifest
   declares an `overlay` entry point (`OmariOverview.qml`) alongside the
