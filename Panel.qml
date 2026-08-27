@@ -11,7 +11,7 @@ import qs.Ui
 // lives in ~/.config/hypr/omari-mode.lua (Hyprland's scrolling layout +
 // 3-finger swipe + column-aware SUPER+arrows); the overview's gesture lives
 // in ~/.config/hypr/omari-overview.lua (4-finger swipe up) and its screen
-// lives in Overview.qml, this plugin's "overlay" entry point. This panel
+// lives in OmariOverview.qml, this plugin's "overlay" entry point. This panel
 // only flips their toggle flags via
 // ~/.config/omarchy/bar/scripts/omari-mode-toggle and
 // ~/.config/omarchy/bar/scripts/omari-overview-toggle, which copy/remove
