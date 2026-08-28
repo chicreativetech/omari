@@ -58,6 +58,16 @@ wallpaper therefore lines up down the middle of the screen. It is declared
 before the scrolling strip so it draws behind the windows, and outside it so
 its drop shadow is not clipped away at the row's top and bottom edges.
 
+**The last row is always an empty one**: bare wallpaper, no windows, standing
+for the next workspace with nothing on it — the lowest id no row is using,
+since a workspace without windows gets no row of its own. Clicking it (or
+pressing Enter with it centred) switches there. It is a plain stand-in object
+in the same row list rather than a real workspace, answering the only three
+things the row delegate ever asks a row for — `id`, `monitor` and
+`toplevels.values` — so counting, centring, snapping and selection need no
+special case for it. An overview with nothing open at all is therefore a
+single bare wallpaper, which is exactly what it is describing.
+
 At rest the strip is positioned so the **monitor rectangle** — not the selected
 window — lands exactly on that centred wallpaper, which is what makes a row
 show what you would actually be looking at were you on that workspace. It is

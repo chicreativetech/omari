@@ -42,12 +42,16 @@ Item {
   property string backgroundImagePath: ""
 
   function open(payloadJson) {
+    // A workspace with no windows has no row of its own, so opening from one
+    // selects the empty row rather than falling back to the top of the list.
     var focused = Hyprland.focusedWorkspace
-    root.selectedWorkspaceId = focused ? focused.id : -1
+    root.selectedWorkspaceId = root.hasWindows(focused)
+      ? focused.id
+      : root.emptyWorkspaceId
     // onSelectedRowChanged covers the case where this lands on a different
     // row than last time; this covers reopening on the same row, where the
     // focused window may still have changed underneath us.
-    root.selectedApp = root.defaultAppIndexFor(root.selectedRow)
+    root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
     bgPathProc.running = true
     root.clearZoom()
     // Start fully zoomed in, onto nothing yet: the surface has to exist and be
@@ -125,7 +129,7 @@ Item {
   // toplevels.values here during evaluation is what keeps this reactive to
   // both new/closed workspaces and windows opening/closing within one,
   // mirroring the bar's own Workspaces.qml.
-  readonly property var workspaceRows: {
+  readonly property var windowedRows: {
     var values = Hyprland.workspaces ? Hyprland.workspaces.values : []
     var rows = []
     for (var i = 0; i < values.length; i++) {
@@ -134,6 +138,59 @@ Item {
     }
     rows.sort(function(a, b) { return a.id - b.id })
     return rows
+  }
+
+  // The workspace the empty row stands for: the lowest id no windowed row is
+  // using. Since a workspace with no windows gets no row, "not on the list"
+  // and "empty" are the same statement, and this is the one Hyprland's own
+  // `empty` selector would take you to next.
+  readonly property int emptyWorkspaceId: {
+    var used = {}
+    var rows = root.windowedRows
+    for (var i = 0; i < rows.length; i++) used[rows[i].id] = true
+    var id = 1
+    while (used[id]) id++
+    return id
+  }
+
+  // Which monitor the empty row is a replica of. It has no workspace of its
+  // own to ask, so it borrows the last row's — that keeps its wallpaper the
+  // same size as the row above it, which is the whole point of drawing it.
+  readonly property var emptyRowMonitor: {
+    var rows = root.windowedRows
+    var last = rows.length > 0 ? rows[rows.length - 1] : null
+    return (last && last.monitor) ? last.monitor : Hyprland.focusedMonitor
+  }
+
+  // One row past the real ones, standing for the next empty workspace: bare
+  // wallpaper, no windows, so the overview always ends on somewhere to go
+  // rather than on the last thing already open.
+  //
+  // Deliberately a plain object rather than a real HyprlandWorkspace, and
+  // deliberately inside the same list: the row delegate only ever asks a row
+  // for `id`, `monitor` and `toplevels.values`, so a stand-in that answers
+  // those three needs no special case anywhere the rows are counted, indexed,
+  // centred, snapped to or selected. `omariEmpty` is what the two places that
+  // do care — the click target and Enter — recognise it by.
+  readonly property var workspaceRows: {
+    var rows = root.windowedRows.slice()
+    rows.push({
+      id: root.emptyWorkspaceId,
+      omariEmpty: true,
+      monitor: root.emptyRowMonitor,
+      toplevels: { values: [] }
+    })
+    return rows
+  }
+
+  function isEmptyRowModel(row) { return !!(row && row.omariEmpty) }
+
+  // Whether a workspace has a row of its own, i.e. whether it has windows.
+  function hasWindows(ws) {
+    if (!ws) return false
+    var rows = root.windowedRows
+    for (var i = 0; i < rows.length; i++) if (rows[i].id === ws.id) return true
+    return false
   }
 
   // Row currently centred in the viewport. Falls back to the first row when
@@ -154,10 +211,25 @@ Item {
 
   // Arrowing onto a row lands on whichever of its windows Hyprland would
   // focus if you switched there, not on its leftmost one.
-  function defaultAppIndexFor(rowIndex) {
-    var ws = root.workspaceRows[rowIndex]
-    if (!ws) return 0
-    return root.focusedIndexFor(root.sortToplevelsBySpatialOrder(ws.toplevels.values))
+  //
+  // Takes the workspace *id*, and that is not a style preference. selectedRow
+  // is a binding over selectedWorkspaceId, and a changed handler on a property
+  // runs before that property's own dependent bindings have been
+  // re-evaluated -- it lags by exactly one change. So reading selectedRow from
+  // onSelectedWorkspaceIdChanged computed the newly centred row's app index
+  // from the row just left: land on a three-window row from a five-window one
+  // and selectedApp came out 4, clamped to that row's last window, and restX
+  // glided the row all the way right to bring it inside the wallpaper -- then
+  // slid it back the moment it stopped being the centred row and its ring
+  // reverted to Hyprland's own focused window. Nothing downstream was wrong;
+  // the index handed to it was.
+  function defaultAppIndexForWorkspace(id) {
+    var rows = root.windowedRows
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].id !== id) continue
+      return root.focusedIndexFor(root.sortToplevelsBySpatialOrder(rows[i].toplevels.values))
+    }
+    return 0
   }
 
   // Keyed on the workspace *id*, not on selectedRow. selectedRow is a binding
@@ -166,7 +238,8 @@ Item {
   // shifts the row index, even transiently, would fire this and silently throw
   // away a left/right selection the user had just made. The id only ever moves
   // when something actually chooses a different workspace.
-  onSelectedWorkspaceIdChanged: root.selectedApp = root.defaultAppIndexFor(root.selectedRow)
+  onSelectedWorkspaceIdChanged:
+    root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
 
   // ---- keyboard navigation ----
   //
@@ -192,6 +265,11 @@ Item {
   }
 
   function activateSelection() {
+    var row = root.workspaceRows[root.selectedRow]
+    if (root.isEmptyRowModel(row)) {
+      root.activateWorkspace(row.id)
+      return
+    }
     var apps = root.selectedToplevels
     if (apps.length === 0) return
     var i = Math.max(0, Math.min(apps.length - 1, root.selectedApp))
@@ -506,6 +584,23 @@ Item {
     root.dispatchFocus(hyprlandToplevel)
   }
 
+  // Switching to the empty row's workspace. Same dispatcher family as
+  // dispatchFocus, and the same close-then-dispatch order for the same
+  // reason: this overlay holds the keyboard grab, and focus dispatched while
+  // it is still mapped is taken straight back when it unmaps. There is no
+  // zoom here — a dive is a dive *into a window*, and the point of this row
+  // is that there is no window on it.
+  //
+  // hl.dsp.focus({ workspace = ... }) rather than hl.dsp.workspace, which in
+  // 0.55 is a table of sub-dispatchers (move, toggle_special, ...) and not
+  // callable; it is also what Omarchy's own SUPER+1..9 bindings use.
+  function activateWorkspace(id) {
+    if (root.pendingActivation) return
+    root.close()
+    Quickshell.execDetached(
+      ["hyprctl", "dispatch", "hl.dsp.focus({ workspace = '" + id + "' })"])
+  }
+
   PanelWindow {
     id: panel
     visible: root.opened
@@ -576,15 +671,10 @@ Item {
         event.accepted = true
       }
 
-      Text {
-        visible: root.workspaceRows.length === 0
-        anchors.centerIn: parent
-        text: "No open windows"
-        color: Color.foreground
-        opacity: 0.5
-        font.family: Style.font.family
-        font.pixelSize: Style.font.heading
-      }
+      // No "No open windows" label any more: the empty row is always drawn,
+      // so an overview with nothing open is one bare wallpaper centred on
+      // screen — which says the same thing in the same language as every
+      // other row, and can be clicked.
 
       Item {
         id: viewport
@@ -684,6 +774,12 @@ Item {
               readonly property int focusedIndex: root.focusedIndexFor(rowItem.sortedToplevels)
 
               readonly property bool current: rowItem.index === root.selectedRow
+
+              // The trailing stand-in row. It draws exactly like any other —
+              // the same wallpaper at the same size — because that *is* what
+              // an empty workspace looks like; it just has no strip to scroll
+              // and a click target of its own instead of thumbnails.
+              readonly property bool isEmptyRow: root.isEmptyRowModel(rowItem.modelData)
 
               // Which thumbnail this row centres on. Only the centred row
               // follows the live left/right selection; every other row stays
@@ -1071,6 +1167,37 @@ Item {
                 // depend on where the mouse was left — see
                 // root.selectedRowScroll(), which the single handler at the
                 // viewport level uses instead.
+              }
+
+              // The empty row's click target: the wallpaper itself, since
+              // there is no thumbnail to aim at. Declared after rowViewport so
+              // it takes the press rather than the backdrop's close handler,
+              // and anchored to monitorRect rather than living inside it so
+              // the ring is not drawn through that item's shadow layer.
+              //
+              // Rings on hover only. Every other row states which window it is
+              // centred on by ringing it; this one has nothing to state, and
+              // which row you are on is already carried by it being the centred
+              // one — so the ring here is purely "this is a thing you can
+              // click", and it uses the accent when it is also the keyboard
+              // row for the same reason the thumbnails do.
+              MouseArea {
+                id: emptyTarget
+                anchors.fill: monitorRect
+                visible: rowItem.isEmptyRow
+                enabled: rowItem.isEmptyRow
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.activateWorkspace(rowItem.modelData.id)
+
+                Rectangle {
+                  anchors.fill: parent
+                  color: "transparent"
+                  border.width: emptyTarget.containsMouse ? Style.space(2) : 0
+                  border.color: rowItem.current
+                    ? Color.accent
+                    : Util.alpha(Color.foreground, 0.4)
+                }
               }
             }
           }
