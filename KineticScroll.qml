@@ -82,10 +82,14 @@ Item {
   property real maxVelocity: 18000  // px/s, cap on a flick
   property real minVelocity: 25     // px/s, below this momentum has stopped
   // bandTau doubles as the edge spring's stiffness (w = 1/bandTau below): the
-  // old 0.085s made for a very stiff, tightly-wound spring that snapped back
-  // rigidly the instant a drag or flick went past an edge. A longer time
-  // constant is a softer spring -- more give, a gentler settle.
-  property real bandTau: 0.35       // s, rubber-band spring time constant
+  // original 0.085s made for a very stiff, tightly-wound spring that snapped
+  // back rigidly the instant a drag or flick went past an edge. A longer time
+  // constant is a softer spring -- more give, a gentler settle. 0.35 was that
+  // correction overshooting the other way: the ease-out read as slow once
+  // every row bounced. Tuned down from there by feel, and it wants to stay
+  // well above the 0.085 end -- the point is that the row eases home, not
+  // that it snaps.
+  property real bandTau: 0.185      // s, rubber-band spring time constant
   property real glideTau: 0.18      // s, discrete-wheel / snap glide time constant
   // How much of the release speed is carried into a snapped axis' landing
   // point. Long enough that a deliberate flick travels past the row it was
@@ -100,6 +104,9 @@ Item {
   // while rubber-banding past an edge.
   property real position: 0
 
+  // Whether this axis has anywhere to go. Only the discrete wheel consults
+  // it: a notch is a request to land somewhere else, and there is nowhere
+  // else. A touchpad drag deliberately does not — see dragBy().
   readonly property bool overflows: root.maxPosition - root.minPosition > 0.5
   readonly property bool snaps: root.snapStride > 0.5
 
@@ -162,8 +169,16 @@ Item {
   // ---- input ----
 
   // A touchpad gesture step: `delta` is raw pixels, applied straight through.
+  //
+  // Deliberately not gated on `overflows`. An axis with no travel still
+  // follows the fingers out into the rubber band and springs back when they
+  // lift: a workspace whose windows all fit inside its monitor has nothing to
+  // bring into view, but refusing its drag outright made the row read as a
+  // dead surface rather than as one that is simply already showing
+  // everything. The bounce is what says which of the two it is — and it is
+  // also what guarantees a window can never be left parked off the wallpaper.
   function dragBy(delta) {
-    if (!root.overflows || delta === 0) return
+    if (delta === 0) return
     // Fingers are back down; whatever the last gesture left coasting is over.
     root.stop()
     root.dragging = true
@@ -190,7 +205,11 @@ Item {
   function endDrag() {
     idle.stop()
     root.dragging = false
-    if (!root.overflows) return
+    // No `overflows` check here either, and it matters more than in dragBy:
+    // this is what hands a drag that went nowhere over to the spring, and
+    // returning early would leave the content parked wherever the fingers
+    // dropped it, outside the travel limits, with nothing running to bring
+    // it back.
     root.velocity = root.measureVelocity()
     root.samples = []
     if (root.snaps) {
@@ -258,9 +277,18 @@ Item {
   property var samples: []
   readonly property int velocityWindow: 90 // ms
 
+  // How much of a drag still reaches the content once it is `over` pixels past
+  // an edge: 1:1 at the edge itself, tapering to a floor that never quite
+  // stops. Both numbers are a quarter of what they were (0.55 / 0.12), which
+  // is the same quarter of the stretch a given drag produces across both
+  // regimes -- the taper and the floor beyond it. The wide version was tuned
+  // when only a long strip ever hit an edge and the give was the whole signal;
+  // now that every row rubber-bands, including ones with nowhere to go, the
+  // band is only there to say "this end, and it does move" and wants to be
+  // barely felt. Roughly a tenth of the wallpaper's width at full stretch.
   function bandResistance(over) {
-    var reach = Math.max(1, root.viewportSize * 0.55)
-    return Math.max(0.12, 1 - Math.abs(over) / reach)
+    var reach = Math.max(1, root.viewportSize * 0.1375)
+    return Math.max(0.03, 1 - Math.abs(over) / reach)
   }
 
   function track(d) {

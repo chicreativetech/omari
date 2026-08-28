@@ -42,6 +42,14 @@ past both edges of their monitor: workspace strips here are commonly 2.5× the
 monitor's width. So the strip, not the monitor, is what scrolls horizontally,
 and it is free to overhang both edges of the screen.
 
+**The wallpaper thumbnail is what the strip scrolls behind**, not the display.
+Travel runs from the first window's left edge lining up with the thumbnail's
+left edge to the last window's right edge lining up with its right one — so a
+row never stops with the last window pinned to the edge of the display and a
+band of empty desktop still showing inside the wallpaper. Windows scrolled past
+either edge stay drawn against the backdrop, the way they overhang a real
+monitor; it is only the limits that the wallpaper frames.
+
 **The wallpaper does not scroll with it.** It is centred horizontally in the
 row and pinned there, so panning a workspace's windows slides them across a
 background that stays put — the way the real desktop behaves under a scrolling
@@ -53,8 +61,9 @@ its drop shadow is not clipped away at the row's top and bottom edges.
 At rest the strip is positioned so the **monitor rectangle** — not the selected
 window — lands exactly on that centred wallpaper, which is what makes a row
 show what you would actually be looking at were you on that workspace. It is
-nudged off that only as far as it must be to keep the ringed window on screen,
-for when left/right has walked past the part of the strip the monitor covers.
+nudged off that only as far as it must be to bring the ringed window inside the
+wallpaper, for when left/right has walked past the part of the strip the
+monitor covers.
 
 One consequence worth knowing: Hyprland reports a monitor's size in *physical*
 pixels but window geometry in *logical* ones, so the monitor is divided back
@@ -202,6 +211,12 @@ deliberately not built out of animated offsets:
 - Overscrolling past either end is resisted progressively and springs back
   under a critically-damped spring, so the ends of the list feel like
   something you can lean on.
+- **Every row takes the drag, including one with nowhere to go.** A workspace
+  whose windows all fit inside its monitor has nothing to bring into view, but
+  refusing its gesture outright made the row read as a dead surface rather than
+  as one already showing everything. It follows the fingers into the band and
+  springs home instead, which also means a window can never be left parked off
+  its wallpaper.
 - Which axis a gesture owns is decided once, from its first delta, and held
   until the fingers lift. Re-deciding per event lets a gesture that wobbles a
   couple of degrees hand itself back and forth between a row and the

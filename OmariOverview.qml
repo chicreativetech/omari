@@ -742,6 +742,13 @@ Item {
               // row — wallpaper and windows alike — is drawn at.
               readonly property real geomScale: rowItem.monH > 0 ? root.rowHeight / rowItem.monH : 0
 
+              // The wallpaper rectangle's width in row pixels. This is the
+              // frame a row's horizontal scrolling is measured against — both
+              // the monitorRect below and rowScroll's travel limits come from
+              // it, so the strip can only ever come to rest with its edges on
+              // the wallpaper's edges, never on the screen's.
+              readonly property real monWidthPx: rowItem.monW * rowItem.geomScale
+
               // Omari mode is a scrolling layout, so a workspace's windows
               // routinely run past both edges of the monitor they are on —
               // that is the whole point of it. The strip is therefore the
@@ -758,6 +765,29 @@ Item {
                   if (r.x < left) left = r.x
                   if (r.x + r.w > right) right = r.x + r.w
                 }
+                return { left: left, right: right }
+              }
+
+              // The extent of the *windows alone*, without the monitor folded
+              // in. The strip above is the union of the two, so on a side
+              // where no window overhangs the monitor the strip's edge is the
+              // monitor's edge — and scrolling the strip's edge onto the
+              // wallpaper's edge would then stop with the last window short of
+              // it, a band of empty desktop still showing. Travel is measured
+              // from this instead. Windows with no geometry yet take the
+              // monitor rectangle, matching where rectInRow puts them, so a
+              // row of them is still reachable.
+              readonly property var winSpan: {
+                var left = NaN
+                var right = NaN
+                var vals = rowItem.sortedToplevels
+                for (var i = 0; i < vals.length; i++) {
+                  var r = root.rectFor(vals[i])
+                  if (!r) r = { x: rowItem.monX, w: rowItem.monW }
+                  if (isNaN(left) || r.x < left) left = r.x
+                  if (isNaN(right) || r.x + r.w > right) right = r.x + r.w
+                }
+                if (isNaN(left)) return { left: rowItem.strip.left, right: rowItem.strip.right }
                 return { left: left, right: right }
               }
 
@@ -814,7 +844,7 @@ Item {
                 id: monitorRect
                 anchors.horizontalCenter: parent.horizontalCenter
                 y: 0
-                width: rowItem.monW * rowItem.geomScale
+                width: rowItem.monWidthPx
                 height: root.rowHeight
                 layer.enabled: true
                 layer.effect: MultiEffect {
@@ -851,39 +881,69 @@ Item {
                 readonly property real contentWidth:
                   (rowItem.strip.right - rowItem.strip.left) * rowItem.geomScale
 
-                // Where the strip comes to rest: the *monitor* rectangle
-                // centred, not the selected window. That is what lines every
-                // row's wallpaper up down the middle of the screen and makes a
+                // The wallpaper rectangle's left edge in this item's
+                // coordinates. It is centred in the row, and it — not this
+                // item — is the window the strip scrolls behind, so every
+                // position below is expressed against it. This item stays the
+                // full width of the row and keeps clipping there, so windows
+                // scrolled past the wallpaper's edges still show against the
+                // backdrop the way they overhang a real monitor.
+                readonly property real monLeft: (rowViewport.width - rowItem.monWidthPx) / 2
+
+                // The windows' own extent in strip coordinates — the two edges
+                // rowScroll's travel runs between.
+                readonly property real winLeft:
+                  (rowItem.winSpan.left - rowItem.strip.left) * rowItem.geomScale
+                readonly property real winRight:
+                  (rowItem.winSpan.right - rowItem.strip.left) * rowItem.geomScale
+
+                // Where the strip comes to rest: the *monitor* rectangle over
+                // the wallpaper, not the selected window. That is what makes a
                 // row show what you would actually be looking at were you on
                 // that workspace — windows fall where the layout puts them,
                 // spilling off both edges as they do on a scrolling layout.
                 //
-                // Nudged off that only as far as it must be to keep the ringed
-                // window on screen, for when left/right has walked past the
-                // part of the strip the monitor covers.
+                // Nudged off that only as far as it must be to bring the ringed
+                // window inside the wallpaper, for when left/right has walked
+                // past the part of the strip the monitor covers.
                 readonly property real restX: {
-                  var monCentre = (rowItem.monX - rowItem.strip.left + rowItem.monW / 2)
-                    * rowItem.geomScale
-                  var pos = monCentre - rowViewport.width / 2
+                  var monOffset = (rowItem.monX - rowItem.strip.left) * rowItem.geomScale
+                  var pos = monOffset - rowViewport.monLeft
                   var vals = rowItem.sortedToplevels
                   var i = rowItem.selectedIndex
                   if (i < 0 || i >= vals.length) return pos
                   var r = rowItem.rectInRow(vals[i])
-                  if (r.x < pos) return r.x
-                  if (r.x + r.w > pos + rowViewport.width) return r.x + r.w - rowViewport.width
+                  var left = pos + rowViewport.monLeft
+                  if (r.x < left) return r.x - rowViewport.monLeft
+                  if (r.x + r.w > left + rowItem.monWidthPx)
+                    return r.x + r.w - rowViewport.monLeft - rowItem.monWidthPx
                   return pos
                 }
 
                 KineticScroll {
                   id: rowScroll
-                  viewportSize: rowViewport.width
-                  // Not "fit the content inside the viewport": the strip is
-                  // meant to overhang both edges, and clamping it to the
-                  // viewport is exactly what would drag the monitor rectangle
-                  // off centre. The travel runs from the strip's own left edge
-                  // to its right one, widened to always contain restX.
-                  minPosition: Math.min(0, rowViewport.restX)
-                  maxPosition: Math.max(rowViewport.contentWidth - rowViewport.width,
+                  viewportSize: rowItem.monWidthPx
+                  // The travel is framed by the wallpaper, not by the screen:
+                  // it runs from the first window's left edge lining up with
+                  // the wallpaper's left edge to the last window's right edge
+                  // lining up with the wallpaper's right edge, widened to
+                  // always contain restX. Measuring against the row's full
+                  // width instead is what used to stop a scroll with the last
+                  // window pinned to the screen edge, a band of empty backdrop
+                  // still inside the wallpaper. Both ends carry the same
+                  // -monLeft shift, which is what puts a strip position on the
+                  // wallpaper rather than on this item.
+                  //
+                  // Widening to restX is not a fallback: a workspace whose
+                  // windows leave a gap at one end of the monitor has a resting
+                  // position past the window edge at that end, and that gap is
+                  // the truth about the workspace. When the windows fit inside
+                  // the monitor entirely both ends collapse onto restX and the
+                  // row simply does not scroll.
+                  minPosition: Math.min(rowViewport.winLeft - rowViewport.monLeft,
+                                        rowViewport.restX)
+                  maxPosition: Math.max(rowViewport.winRight - rowViewport.monLeft
+                                          - rowItem.monWidthPx,
                                         rowViewport.restX)
                   // Left/right arrows move rowItem.selectedIndex, which moves
                   // this, which glides the strip along. The horizontal axis
