@@ -26,19 +26,23 @@ hl.config({
 -- than in input.lua.
 hl.gesture({ fingers = 3, direction = "horizontal", action = "scroll_move" })
 
--- The "workspace" gesture action isn't a compositor-wide default -- it only
--- exists where something registers it with hl.gesture. Nothing else in this
--- config does, so claiming the horizontal 3-finger swipe above for
--- scroll_move left vertical 3-finger swipes with no gesture to run at all,
--- silently killing workspace switching while this mode is on. Register it
--- explicitly so switching still works alongside the tape scroll.
-hl.gesture({ fingers = 3, direction = "vertical", action = "workspace" })
+-- Vertical 3-finger swipes are NOT registered here. input.lua already owns
+-- that gesture, and it loads before this file (hyprland.lua requires
+-- hypr.input at line 20, default.hypr.toggles at line 26), so a second
+-- registration is shadowed by the first and Hyprland warns about it:
+--   "gesture will be overshadowed by a previous gesture.
+--    previous VERTICAL shadows new VERTICAL"
+-- The split is deliberate and input.lua says so from its side: vertical
+-- switches workspaces whatever the layout, so it belongs in the always-on
+-- config, while the horizontal swipe above only means anything while the
+-- scrolling layout is active, so it belongs here.
 
 -- Omarchy ships the "workspaces" animation leaf disabled (instant switch,
 -- no slide) since its default SUPER+number switching has no swipe direction
--- to match. Now that switching is a vertical swipe, the switch should
--- animate along that same axis -- same style/speed/bezier Omarchy already
--- uses for the (also vertical-swipe-driven) specialWorkspace animation.
+-- to match. Workspace switching here is a vertical swipe (input.lua's
+-- gesture), so the switch should animate along that same axis -- same
+-- style/speed/bezier Omarchy already uses for the (also
+-- vertical-swipe-driven) specialWorkspace animation.
 hl.animation({ leaf = "workspaces", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert" })
 
 -- Omarchy's default SUPER+arrows use hl.dsp.focus({direction=...}), the
