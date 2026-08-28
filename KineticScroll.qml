@@ -12,10 +12,20 @@ import QtQuick
 //
 // Here a touchpad gesture moves `position` 1:1 with the fingers with no
 // animation anywhere in that path. The only animation is what happens after
-// the fingers lift: momentum that decays at a constant rate, and a
-// critically-damped spring back to the edge if the gesture ended (or the
-// momentum ran) past one. A discrete mouse wheel has no fingers to track, so
-// it gets its own mode: a fixed step glided into place.
+// the fingers lift, and there are two flavours of that:
+//
+//   free (snapStride 0)  -- momentum decaying at a constant rate, plus a
+//     critically-damped spring back to the edge if the gesture ended (or the
+//     momentum ran) past one. This is what the horizontal strips use.
+//   snapped (snapStride > 0) -- the axis always comes to rest on a multiple
+//     of snapStride from minPosition, glided into place. The vertical list
+//     uses this so a workspace row is centred whenever the fingers are off
+//     the touchpad. A flick still counts: its remaining speed is projected
+//     forward to choose the landing point, so a nudge moves one row and a
+//     firm swipe crosses several.
+//
+// A discrete mouse wheel has no fingers to track, so it gets its own mode: a
+// fixed step (or exactly one snap point) glided into place.
 Item {
   id: root
 
@@ -23,11 +33,30 @@ Item {
   property real viewportSize: 0
   property real contentSize: 0
 
-  // Offset this axis rests at until the user scrolls it. The overview
-  // recomputes this as screencopy resolves real thumbnail aspect ratios, so
-  // it has to be a live binding target rather than a one-shot assignment --
-  // but only until the user takes over, after which it is ignored.
+  // Travel limits. The defaults are plain "scroll the content through the
+  // viewport" bounds, which is what the horizontal strips want, but both are
+  // overridable: the vertical list centres a row rather than filling the
+  // viewport, so its range runs from "first row centred" (negative whenever a
+  // row is shorter than the viewport) to "last row centred". Deriving the
+  // limits from content size is what used to make centring the first and last
+  // rows impossible -- clamping simply pinned them to the top and bottom.
+  property real minPosition: 0
+  property real maxPosition: Math.max(0, root.contentSize - root.viewportSize)
+
+  // Offset this axis wants to be at when nothing is being dragged: the
+  // centred row, or the centred thumbnail. Followed instantly while the view
+  // is still resolving its geometry and glided to once it has settled (see
+  // `interactive`) -- which is what makes arrow-key navigation animate while
+  // screencopy resolving a thumbnail's real aspect ratio does not flash.
   property real restPosition: 0
+
+  // Spacing of the snap points, measured from minPosition. 0 leaves this axis
+  // free-scrolling.
+  property real snapStride: 0
+
+  // Emitted whenever a gesture or wheel step settles on a snap point, so the
+  // owner can keep its own selection in step with whatever is now centred.
+  signal snapped(int index)
 
   // ---- feel ----
   // Touchpad drags arrive already scaled by Hyprland's global
@@ -41,7 +70,7 @@ Item {
   // layer-shell surface, not a tracked window, so dragScale compensates
   // directly in dragBy() instead.
   property real dragScale: 1
-  property real notchPixels: 110    // travel per discrete mouse-wheel notch
+  property real notchPixels: 110    // travel per discrete mouse-wheel notch, free axes only
   // Momentum decay is exponential (velocity loses a fraction of itself per
   // unit time, like the glide/band eases below) rather than the constant
   // px/s^2 this used to subtract every frame. Constant deceleration keeps
@@ -57,30 +86,58 @@ Item {
   // rigidly the instant a drag or flick went past an edge. A longer time
   // constant is a softer spring -- more give, a gentler settle.
   property real bandTau: 0.35       // s, rubber-band spring time constant
-  property real glideTau: 0.18      // s, discrete-wheel glide time constant
+  property real glideTau: 0.18      // s, discrete-wheel / snap glide time constant
+  // How much of the release speed is carried into a snapped axis' landing
+  // point. Long enough that a deliberate flick travels past the row it was
+  // over, short enough that letting go of a slow drag lands on the nearest
+  // one rather than sailing away.
+  property real snapProjection: 0.3 // s
 
   // ---- state out ----
 
   // Scroll offset in content pixels: the content should be drawn at
-  // -position along this axis. Steps outside [0, maxPosition] only while
-  // rubber-banding past an edge.
+  // -position along this axis. Steps outside [minPosition, maxPosition] only
+  // while rubber-banding past an edge.
   property real position: 0
 
-  readonly property real maxPosition: Math.max(0, root.contentSize - root.viewportSize)
-  readonly property bool overflows: root.contentSize - root.viewportSize > 0.5
+  readonly property bool overflows: root.maxPosition - root.minPosition > 0.5
+  readonly property bool snaps: root.snapStride > 0.5
 
-  // True once the user has scrolled this axis, which is what stops
-  // restPosition from yanking it back to centre mid-scroll.
-  property bool engaged: false
+  readonly property int lastSnapIndex: root.snaps
+    ? Math.max(0, Math.round((root.maxPosition - root.minPosition) / root.snapStride))
+    : 0
 
-  function clamp(p) { return Math.max(0, Math.min(root.maxPosition, p)) }
+  // True for as long as the fingers are down, so a restPosition that moves
+  // mid-gesture (a thumbnail's aspect ratio landing, a row appearing) cannot
+  // fight the drag.
+  property bool dragging: false
+
+  // False for the first frames after the view opens, while geometry and
+  // thumbnail aspect ratios are still resolving and restPosition therefore
+  // moves several times; following it instantly keeps all of that invisible.
+  // It flips on a short timer, or immediately on the first input, since past
+  // that point restPosition only ever moves because the user navigated
+  // somewhere — and that should animate.
+  property bool interactive: false
+
+  function clamp(p) { return Math.max(root.minPosition, Math.min(root.maxPosition, p)) }
 
   // The edge `p` has gone past, or undefined if it is in range. Doubles as
   // the "are we in the rubber-band zone" test.
   function edgeFor(p) {
-    if (p < 0) return 0
+    if (p < root.minPosition) return root.minPosition
     if (p > root.maxPosition) return root.maxPosition
     return undefined
+  }
+
+  function snapIndexFor(p) {
+    if (!root.snaps) return 0
+    var i = Math.round((p - root.minPosition) / root.snapStride)
+    return Math.max(0, Math.min(root.lastSnapIndex, i))
+  }
+
+  function snapPositionFor(index) {
+    return root.clamp(root.minPosition + index * root.snapStride)
   }
 
   function reset() {
@@ -89,7 +146,10 @@ Item {
     idle.stop()
     root.velocity = 0
     root.samples = []
-    root.engaged = false
+    root.notchAccum = 0
+    root.dragging = false
+    root.interactive = false
+    settleTimer.restart()
     root.position = root.clamp(root.restPosition)
   }
 
@@ -104,9 +164,10 @@ Item {
   // A touchpad gesture step: `delta` is raw pixels, applied straight through.
   function dragBy(delta) {
     if (!root.overflows || delta === 0) return
-    root.engaged = true
     // Fingers are back down; whatever the last gesture left coasting is over.
     root.stop()
+    root.dragging = true
+    root.interactive = true
 
     var d = delta * root.dragScale
     var over = root.edgeFor(root.position)
@@ -123,25 +184,65 @@ Item {
     idle.restart()
   }
 
-  // The fingers lifted: hand whatever speed they had over to momentum.
+  // The fingers lifted: on a free axis hand whatever speed they had over to
+  // momentum, on a snapped one use it to pick which snap point they were
+  // heading for.
   function endDrag() {
     idle.stop()
+    root.dragging = false
     if (!root.overflows) return
     root.velocity = root.measureVelocity()
     root.samples = []
+    if (root.snaps) {
+      var i = root.snapIndexFor(root.position + root.velocity * root.snapProjection)
+      root.glideTo(root.snapPositionFor(i))
+      root.snapped(i)
+      return
+    }
     runner.mode = "momentum"
     runner.running = true
   }
 
   // One or more discrete mouse-wheel notches. No fingers to track, so this
-  // glides a fixed step instead, accumulating onto any glide already in
-  // flight so spinning the wheel keeps building speed.
+  // glides into place instead: one snap point per notch on a snapped axis,
+  // a fixed step on a free one (accumulating onto any glide already in flight
+  // so spinning the wheel keeps building speed).
   function stepBy(notches) {
     if (!root.overflows || notches === 0) return
-    root.engaged = true
+    root.interactive = true
+
+    if (root.snaps) {
+      // High-resolution wheels report fractions of a notch, so accumulate
+      // rather than treating every event as a whole row.
+      root.notchAccum += notches
+      var whole = root.notchAccum > 0
+        ? Math.floor(root.notchAccum)
+        : Math.ceil(root.notchAccum)
+      if (whole === 0) return
+      root.notchAccum -= whole
+      var from = runner.mode === "glide" ? runner.target : root.position
+      var i = Math.max(0, Math.min(root.lastSnapIndex, root.snapIndexFor(from) + whole))
+      root.glideTo(root.snapPositionFor(i))
+      root.snapped(i)
+      return
+    }
+
     var base = runner.mode === "glide" ? runner.target : root.position
-    runner.target = root.clamp(base + notches * root.notchPixels)
+    root.glideTo(base + notches * root.notchPixels)
+  }
+
+  // Ease to an exact offset. The path taken by everything that navigates
+  // rather than drags: wheel steps, a snapped gesture's landing point, and
+  // restPosition moving under arrow-key navigation.
+  function glideTo(target) {
+    var t = root.clamp(target)
     root.velocity = 0
+    if (Math.abs(t - root.position) < 0.5) {
+      root.position = t
+      root.stop()
+      return
+    }
+    runner.target = t
     runner.mode = "glide"
     runner.running = true
   }
@@ -149,6 +250,7 @@ Item {
   // ---- internals ----
 
   property real velocity: 0
+  property real notchAccum: 0
 
   // Recent gesture deltas, so the flick speed at release is measured over a
   // short window rather than taken from the single last event (which on a
@@ -181,12 +283,18 @@ Item {
   }
 
   // Not every touchpad stack delivers a Qt.ScrollEnd phase when the fingers
-  // lift. Without one, `engaged` would never hand off to momentum and the
-  // content would just halt dead. A short idle timeout is the fallback.
+  // lift. Without one the axis would never settle -- on a snapped one it
+  // would just halt between two rows. A short idle timeout is the fallback.
   Timer {
     id: idle
     interval: 140
     onTriggered: root.endDrag()
+  }
+
+  Timer {
+    id: settleTimer
+    interval: 150
+    onTriggered: root.interactive = true
   }
 
   // Vsync-locked: one tick per rendered frame, with the real frame delta, so
@@ -244,12 +352,19 @@ Item {
     }
   }
 
-  onRestPositionChanged: if (!root.engaged) root.position = root.clamp(root.restPosition)
-
-  onMaxPositionChanged: {
-    if (runner.running) return
-    root.position = root.engaged ? root.clamp(root.position) : root.clamp(root.restPosition)
+  onRestPositionChanged: {
+    if (root.dragging) return
+    if (root.interactive) root.glideTo(root.restPosition)
+    else root.position = root.clamp(root.restPosition)
   }
+
+  function reclamp() {
+    if (root.dragging || runner.running) return
+    root.position = root.clamp(root.interactive ? root.position : root.restPosition)
+  }
+
+  onMinPositionChanged: root.reclamp()
+  onMaxPositionChanged: root.reclamp()
 
   Component.onCompleted: root.position = root.clamp(root.restPosition)
 }

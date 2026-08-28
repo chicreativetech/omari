@@ -26,11 +26,16 @@ Item {
 
   property bool opened: false
 
-  // The workspace that was active the moment the overview was opened. Used
-  // once, at open time, to vertically center that row — not kept in sync
-  // afterward, since nothing inside the overview changes the active
-  // workspace without also closing it.
-  property int openedWorkspaceId: -1
+  // ---- selection ----
+  //
+  // The whole overview hangs off these two. The selected workspace is stored
+  // by id rather than by row index so it survives the row list resolving
+  // late, or a workspace opening/closing while the overview is up; the row
+  // index is derived from it. It starts as whatever workspace was active when
+  // the overview opened, and from then on tracks whichever row is centred —
+  // by arrow key, by wheel, or by a two-finger swipe snapping to rest.
+  property int selectedWorkspaceId: -1
+  property int selectedApp: 0
 
   // Current desktop background image, resolved from the same symlink the
   // background plugin follows. Refreshed each time the overview opens.
@@ -38,11 +43,25 @@ Item {
 
   function open(payloadJson) {
     var focused = Hyprland.focusedWorkspace
-    root.openedWorkspaceId = focused ? focused.id : -1
+    root.selectedWorkspaceId = focused ? focused.id : -1
+    // onSelectedRowChanged covers the case where this lands on a different
+    // row than last time; this covers reopening on the same row, where the
+    // focused window may still have changed underneath us.
+    root.selectedApp = root.defaultAppIndexFor(root.selectedRow)
     bgPathProc.running = true
+    root.clearZoom()
+    // Start fully zoomed in, onto nothing yet: the surface has to exist and be
+    // laid out before there is a thumbnail to measure, so zoomOpenTimer does
+    // the measuring a couple of frames from now. Until then the strip is held
+    // invisible and the backdrop is fully transparent, so what shows through
+    // is the real desktop — which is exactly the frame the zoom-out should
+    // start from anyway.
+    root.zoomProgress = 1
+    root.zoomReady = false
     root.opened = true
     root.gestureAxis = ""
     vScroll.reset()
+    zoomOpenTimer.begin()
   }
 
   // Reset rather than just hide: a flick still coasting when the overview
@@ -51,6 +70,8 @@ Item {
   function close() {
     root.opened = false
     root.gestureAxis = ""
+    zoomOpenTimer.stop()
+    root.clearZoom()
     vScroll.reset()
   }
   function toggle() { if (root.opened) root.close(); else root.open() }
@@ -64,39 +85,41 @@ Item {
     }
   }
 
-  readonly property real rowHeight: Style.space(200) * 2.5 // 150% larger than the original thumbnail size
+  // A workspace takes up half the screen, and that is a *ratio*, not a pixel
+  // count: what the overview is for is showing how much of the workspaces
+  // either side of you there is to see, and that is inherently a fraction of
+  // the viewport. Pinning it to Style.space() instead made rows fill 58% of a
+  // laptop panel and a third of a large monitor — the same numbers, a
+  // different overview. The floor keeps it sane before the layer surface has
+  // been given its size, and on a very short screen.
+  //
+  // A row *is* the monitor rectangle, drawn at this height, so this is both
+  // the wallpaper thumbnail's height and the scale everything in the row is
+  // drawn at (see geomScale in the row delegate).
+  readonly property real rowHeight: Math.max(Style.space(120), panel.height * 0.5)
 
   // Screencopy capture resolution is deliberately NOT tied to rowHeight.
   // Thumbnails capture live while their row is on screen, so requesting a
-  // 2.5x-larger buffer per thumbnail multiplies sustained GPU/compositor
-  // load a lot. A thumbnail this size doesn't need more source pixels than
-  // it always did — only the on-screen presentation got bigger.
+  // proportionally larger buffer per thumbnail multiplies sustained
+  // GPU/compositor load a lot. A thumbnail this size doesn't need more source
+  // pixels than it always did — only the on-screen presentation got bigger.
   readonly property real captureBaseHeight: Style.space(200)
-  readonly property real rowSpacing: Style.space(28)
-  readonly property real thumbSpacing: Style.space(16)
-  readonly property real fallbackAspect: 16 / 10
-  readonly property real bgOversize: 1.05 // background thumbnail vs. app thumbnail height
+
+  // Like rowHeight, a ratio: the gap between two workspaces reads relative to
+  // how big a workspace is, not in absolute pixels.
+  readonly property real rowSpacing: Math.round(root.rowHeight * 0.104)
 
   // How far outside the viewport a row still counts as "on screen" for the
   // purpose of capturing live. One row's worth of slack means a row is
   // already streaming by the time it scrolls into view, and stops streaming
   // well after it has left — so a scroll that hovers around a boundary never
   // thrashes captures on and off.
-  readonly property real liveMargin: root.uniformRowHeight
+  readonly property real liveMargin: root.rowHeight
 
-  // Every row is the same height (the label uses one fixed font regardless
-  // of its text), so this can be computed once via FontMetrics instead of
-  // asking a live rowRepeater delegate for its size — the latter is racy
-  // right after the model changes, since a delegate may not exist yet the
-  // instant Repeater.count ticks up.
-  FontMetrics {
-    id: rowLabelMetrics
-    font.family: Style.font.family
-    font.pixelSize: Style.font.caption
-  }
-  readonly property real rowLabelHeight: rowLabelMetrics.height
-  readonly property real uniformRowHeight: root.rowLabelHeight + Style.space(10) + root.rowHeight
-  readonly property real rowStride: root.uniformRowHeight + root.rowSpacing
+  // Rows are a plain uniform height — no label, no per-row chrome — which is
+  // what lets every "where is row i" question in here be arithmetic rather
+  // than a live geometry read off a delegate that may not exist yet.
+  readonly property real rowStride: root.rowHeight + root.rowSpacing
 
   // Only workspaces that actually have windows are worth a row; reading
   // toplevels.values here during evaluation is what keeps this reactive to
@@ -111,6 +134,229 @@ Item {
     }
     rows.sort(function(a, b) { return a.id - b.id })
     return rows
+  }
+
+  // Row currently centred in the viewport. Falls back to the first row when
+  // the selected workspace has gone away (its last window closed while the
+  // overview was open), which is also the sensible answer before anything has
+  // been selected.
+  readonly property int selectedRow: {
+    for (var i = 0; i < root.workspaceRows.length; i++) {
+      if (root.workspaceRows[i].id === root.selectedWorkspaceId) return i
+    }
+    return 0
+  }
+
+  readonly property var selectedToplevels: {
+    var ws = root.workspaceRows[root.selectedRow]
+    return ws ? root.sortToplevelsBySpatialOrder(ws.toplevels.values) : []
+  }
+
+  // Arrowing onto a row lands on whichever of its windows Hyprland would
+  // focus if you switched there, not on its leftmost one.
+  function defaultAppIndexFor(rowIndex) {
+    var ws = root.workspaceRows[rowIndex]
+    if (!ws) return 0
+    return root.focusedIndexFor(root.sortToplevelsBySpatialOrder(ws.toplevels.values))
+  }
+
+  // Keyed on the workspace *id*, not on selectedRow. selectedRow is a binding
+  // over workspaceRows, which Hyprland re-evaluates on every model update — a
+  // window opening anywhere, or just a title changing — and any of those that
+  // shifts the row index, even transiently, would fire this and silently throw
+  // away a left/right selection the user had just made. The id only ever moves
+  // when something actually chooses a different workspace.
+  onSelectedWorkspaceIdChanged: root.selectedApp = root.defaultAppIndexFor(root.selectedRow)
+
+  // ---- keyboard navigation ----
+  //
+  // Up/down move between workspace rows, left/right between the apps in the
+  // centred row. Neither moves the scrollers directly: they move the
+  // selection, and the scrollers follow it through their restPosition
+  // bindings. Marking the vertical scroller interactive first is what makes
+  // that follow a glide rather than a jump on the very first key press, back
+  // when the overview has only just opened.
+  function moveRow(delta) {
+    var rows = root.workspaceRows
+    if (rows.length === 0) return
+    var next = Math.max(0, Math.min(rows.length - 1, root.selectedRow + delta))
+    if (next === root.selectedRow) return
+    vScroll.interactive = true
+    root.selectedWorkspaceId = rows[next].id
+  }
+
+  function moveApp(delta) {
+    var apps = root.selectedToplevels
+    if (apps.length === 0) return
+    root.selectedApp = Math.max(0, Math.min(apps.length - 1, root.selectedApp + delta))
+  }
+
+  function activateSelection() {
+    var apps = root.selectedToplevels
+    if (apps.length === 0) return
+    var i = Math.max(0, Math.min(apps.length - 1, root.selectedApp))
+    root.activateToplevel(apps[i], root.selectedRow, i)
+  }
+
+  // ---- zoom ----
+  //
+  // The overview *is* the desktop seen from further away, so it should arrive
+  // by falling back from the window you were on and leave by diving into the
+  // one you picked. Both directions are one transform driven by a single
+  // progress: at 0 the strip sits exactly where the overview lays it out, and
+  // at 1 the target window's thumbnail covers the real window's own place on
+  // screen at real size — so at the moment the overlay goes away, nothing
+  // jumps. Scaling about a fixed origin would not do that: a thumbnail grown
+  // to real size around its own centre still ends up wherever the overview
+  // happened to put it, which is not where the window is.
+  //
+  // Every term is identity until a capture fills them in, so a capture that
+  // fails leaves the overview behaving exactly as it does with none of this.
+  property real zoomProgress: 0   // 0 = overview, 1 = target at real size and place
+  property real zoomScale: 1      // scale at progress 1, i.e. 1 / the row's geomScale
+  property real zoomThumbX: 0     // target thumbnail's top-left, in zoomLayer coords
+  property real zoomThumbY: 0
+  property real zoomRealX: 0      // where that window actually is on screen
+  property real zoomRealY: 0
+  property bool zoomReady: true
+  property var pendingActivation: null
+
+  readonly property real zoomFactor: 1 + root.zoomProgress * (root.zoomScale - 1)
+
+  // Ramping the scale alone would drag the target away from both endpoints in
+  // between; this holds its top-left on the straight line from thumbnail to
+  // real window for the whole ramp.
+  function zoomOffset(thumbPos, realPos) {
+    return thumbPos + (realPos - thumbPos) * root.zoomProgress
+      - root.zoomFactor * thumbPos
+  }
+
+  // Measures the thumbnail's live on-screen box rather than recomputing the
+  // layout from the model, so it stays correct when a row has been scrolled
+  // away from its resting position.
+  function captureZoom(rowIndex, appIndex) {
+    var row = rowRepeater.itemAt(rowIndex)
+    if (!row) return false
+    var item = row.thumbItemAt(appIndex)
+    if (!item || item.width <= 0 || item.height <= 0) return false
+    var r = root.rectFor(item.modelData)
+    if (!r) return false
+    var p = item.mapToItem(zoomLayer, 0, 0)
+    root.zoomThumbX = p.x
+    root.zoomThumbY = p.y
+    // The overlay covers the monitor, so a window's place on screen is just
+    // its layout rectangle less the monitor's own origin.
+    root.zoomRealX = r.x - row.monX
+    root.zoomRealY = r.y - row.monY
+    root.zoomScale = r.w / item.width
+    return true
+  }
+
+  function clearZoom() {
+    zoomOutAnim.stop()
+    zoomInAnim.stop()
+    root.pendingActivation = null
+    root.zoomProgress = 0
+    root.zoomScale = 1
+    root.zoomThumbX = 0
+    root.zoomThumbY = 0
+    root.zoomRealX = 0
+    root.zoomRealY = 0
+    root.zoomReady = true
+  }
+
+  // The dive runs first and the focus goes out at the end of it, once the
+  // overlay has been torn down — see focusToplevel for why that order is not
+  // negotiable. Dispatching early to overlap the workspace switch with the
+  // animation was tried and is wrong: the focus lands while the keyboard grab
+  // is still held, and the unmap takes it straight back.
+  function activateToplevel(toplevel, rowIndex, appIndex) {
+    if (!toplevel) return
+    if (root.pendingActivation) return
+    if (!root.captureZoom(rowIndex, appIndex)) {
+      root.focusToplevel(toplevel)
+      return
+    }
+    root.pendingActivation = toplevel
+    root.zoomProgress = 0
+    zoomInAnim.restart()
+  }
+
+  function finishActivation() {
+    var toplevel = root.pendingActivation
+    root.pendingActivation = null
+    root.focusToplevel(toplevel)
+  }
+
+  // The capture needs a surface that has been *laid out*, not merely one whose
+  // delegates exist. Measuring too early is not a near miss: while the layer
+  // surface is still unsized panel.height is 0, so rowHeight sits on its floor
+  // and a thumbnail measures a fraction of its eventual size — which lands in
+  // zoomScale as a factor of seven rather than two and flings the strip off
+  // screen. Waiting a fixed couple of frames is not enough either, since the
+  // compositor decides when the surface gets its size.
+  //
+  // So: poll, and require a real size to have held for two consecutive ticks,
+  // which gives Column a polish pass in between to position the rows that
+  // mapToItem is about to be asked about.
+  Timer {
+    id: zoomOpenTimer
+    interval: 16
+    repeat: true
+    property int ticks: 0
+    property bool wasSized: false
+
+    function begin() {
+      zoomOpenTimer.ticks = 0
+      zoomOpenTimer.wasSized = false
+      zoomOpenTimer.restart()
+    }
+
+    onTriggered: {
+      if (!root.opened) { zoomOpenTimer.stop(); return }
+      zoomOpenTimer.ticks++
+
+      var sized = panel.height > 0 && column.height > 0
+      if (sized && zoomOpenTimer.wasSized) {
+        zoomOpenTimer.stop()
+        if (root.captureZoom(root.selectedRow, root.selectedApp)) {
+          root.zoomReady = true
+          zoomOutAnim.restart()
+        } else {
+          root.clearZoom()
+        }
+        return
+      }
+      zoomOpenTimer.wasSized = sized
+
+      // Never leave the strip hidden waiting for a size that isn't coming:
+      // give up after a quarter second and just show the overview.
+      if (zoomOpenTimer.ticks > 15) {
+        zoomOpenTimer.stop()
+        root.clearZoom()
+      }
+    }
+  }
+
+  NumberAnimation {
+    id: zoomOutAnim
+    target: root
+    property: "zoomProgress"
+    from: 1
+    to: 0
+    duration: 260
+    easing.type: Easing.OutCubic
+  }
+
+  NumberAnimation {
+    id: zoomInAnim
+    target: root
+    property: "zoomProgress"
+    from: 0
+    to: 1
+    duration: 200
+    easing.type: Easing.InCubic
+    onFinished: root.finishActivation()
   }
 
   // ---- scroll input routing ----
@@ -136,6 +382,19 @@ Item {
   function axisFor(dx, dy) {
     if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return ""
     return Math.abs(dx) > Math.abs(dy) ? "x" : "y"
+  }
+
+  // The scroller a horizontal gesture drives: the centred row's, always.
+  //
+  // This used to be routed by pointer position — each row carried its own
+  // wheel handler and got the event only when the cursor was over it — which
+  // meant a two-finger swipe scrolled whichever row the mouse happened to have
+  // been left on, and did nothing at all if that row had nothing to scroll.
+  // A touchpad gesture has no pointer to speak of, and everything else in here
+  // (left/right, Enter, the ring) already acts on the centred row.
+  function selectedRowScroll() {
+    var row = rowRepeater.itemAt(root.selectedRow)
+    return row ? row.hScroll : null
   }
 
   // Releases the axis lock if the gesture's Qt.ScrollEnd never arrives.
@@ -182,6 +441,27 @@ Item {
     return arr
   }
 
+  // A window's real rectangle in Hyprland's layout coordinates, or null when
+  // it has no usable geometry yet. This is what lets a row be drawn as a
+  // scaled replica of the workspace rather than a strip of same-height tiles:
+  // every window keeps its true size and position relative to the monitor, so
+  // a half-width window is half the width of the wallpaper behind it.
+  //
+  // Note these are *logical* pixels, while HyprlandMonitor reports its size in
+  // physical ones — see geomScale in the row delegate, which divides the
+  // monitor back down before the two are compared.
+  function rectFor(toplevel) {
+    var ipc = toplevel ? toplevel.lastIpcObject : undefined
+    var at = ipc ? ipc.at : undefined
+    var size = ipc ? ipc.size : undefined
+    if (!at || !size || at.length < 2 || size.length < 2) return null
+    var x = Number(at[0]), y = Number(at[1])
+    var w = Number(size[0]), h = Number(size[1])
+    if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) return null
+    if (w <= 0 || h <= 0) return null
+    return { x: x, y: y, w: w, h: h }
+  }
+
   // Dispatches through Hyprland itself (hl.dsp.focus({ window = ... })),
   // rather than the generic wlr-foreign-toplevel activate() request that
   // used to run here: activate() only asks for keyboard focus and leaves it
@@ -192,20 +472,38 @@ Item {
   // workspace to the window's as an intrinsic part of focusing it, so this
   // reaches both the app and its workspace deterministically.
   //
-  // Shells out to `hyprctl dispatch` (via Util.execArgv) instead of calling
-  // Quickshell's own Hyprland.dispatch() QML method: that method silently
-  // has no effect here, most likely because it still speaks Hyprland's
-  // pre-0.55 two-part "dispatch <name> <args>" wire format, while 0.55+
-  // parses `hyprctl dispatch <arg>` as a Lua expression fed to hl.dispatch()
-  // -- exactly what this line sends. `hyprctl dispatch` itself was verified
+  // Shells out to `hyprctl dispatch` instead of calling Quickshell's own
+  // Hyprland.dispatch() QML method: that method silently has no effect here,
+  // most likely because it still speaks Hyprland's pre-0.55 two-part
+  // "dispatch <name> <args>" wire format, while 0.55+ parses
+  // `hyprctl dispatch <arg>` as a Lua expression fed to hl.dispatch() --
+  // exactly what this line sends. `hyprctl dispatch` itself was verified
   // directly against a live window and does switch focus + workspace.
-  function focusToplevel(hyprlandToplevel) {
+  //
+  // Spawned bare, NOT through Util.execArgv: that helper runs everything under
+  // `bash -lc`, and a login shell costs ~280ms here sourcing profile scripts —
+  // against ~10ms for hyprctl itself. It was the whole of the lag between the
+  // overview closing and the workspace actually changing. Nothing on this
+  // command line needs a shell: no globbing, no variables, no PATH lookup
+  // beyond /usr/bin, which the shell process already has.
+  function dispatchFocus(hyprlandToplevel) {
     var ipc = hyprlandToplevel && hyprlandToplevel.lastIpcObject
     var address = ipc ? ipc.address : undefined
-    if (address) {
-      Util.execArgv(["hyprctl", "dispatch", "hl.dsp.focus({ window = 'address:" + address + "' })"])
-    }
+    if (!address) return
+    Quickshell.execDetached(
+      ["hyprctl", "dispatch", "hl.dsp.focus({ window = 'address:" + address + "' })"])
+  }
+
+  // Close *first*, then dispatch. This overlay holds the keyboard grab
+  // (WlrKeyboardFocus.Exclusive), and when that surface unmaps Hyprland
+  // restores focus to whatever held it before the overlay opened — undoing a
+  // focus dispatched while the overlay was still up. The old code appeared to
+  // dispatch first, but routed it through `bash -lc`, whose ~280ms of login
+  // shell meant it actually landed well after the unmap; making the spawn fast
+  // removed that accidental delay and with it the focus.
+  function focusToplevel(hyprlandToplevel) {
     root.close()
+    root.dispatchFocus(hyprlandToplevel)
   }
 
   PanelWindow {
@@ -226,12 +524,18 @@ Item {
 
     Rectangle {
       anchors.fill: parent
-      // Darker than the theme's flat Color.background so the overview's own
-      // backdrop recedes behind the thumbnails' live app colors and the
-      // wallpaper, instead of competing with them at the same tone. Slightly
-      // transparent so a hint of the real desktop underneath still shows
-      // through instead of a flat, opaque wall.
-      color: Util.alpha(Qt.darker(Color.background, 2.2), 0.9)
+      // Flat, opaque, and *lighter* than the theme's Color.background, not
+      // darker. The overview is nothing but dark app thumbnails, and the
+      // wallpaper thumbnail behind each row carries its own drop shadow —
+      // against a near-black backdrop both the shadows and the windows' own
+      // edges disappear, and the rows read as one continuous smear. A mid
+      // grey is what separates them. Opaque for the same reason: letting the
+      // real desktop show through put live wallpaper detail directly behind
+      // thumbnails of that same wallpaper.
+      color: Qt.lighter(Color.background, 1.75)
+      // Fades out as the view dives into a window, so what the strip is
+      // growing against is the real desktop it is about to become.
+      opacity: 1 - root.zoomProgress
     }
 
     MouseArea {
@@ -245,10 +549,31 @@ Item {
       focus: panel.visible
 
       Keys.onPressed: function(event) {
-        if (event.key === Qt.Key_Escape) {
+        switch (event.key) {
+        case Qt.Key_Escape:
           root.close()
-          event.accepted = true
+          break
+        case Qt.Key_Up:
+          root.moveRow(-1)
+          break
+        case Qt.Key_Down:
+          root.moveRow(1)
+          break
+        case Qt.Key_Left:
+          root.moveApp(-1)
+          break
+        case Qt.Key_Right:
+          root.moveApp(1)
+          break
+        case Qt.Key_Return:
+        case Qt.Key_Enter:
+        case Qt.Key_Space:
+          root.activateSelection()
+          break
+        default:
+          return
         }
+        event.accepted = true
       }
 
       Text {
@@ -264,46 +589,73 @@ Item {
       Item {
         id: viewport
         anchors.fill: parent
-        anchors.margins: Style.space(48)
+        // No margin: the rows above and below the centred one are meant to
+        // run off the top and bottom edges of the screen. Insetting the
+        // viewport instead frames them inside a backdrop border, which reads
+        // as "a list that happens to be cut off" rather than "one workspace
+        // in focus with its neighbours just out of view".
         clip: true
 
-        // Index of the workspace that was focused when the overview opened,
-        // recomputed reactively (not read once imperatively) so this is
-        // never at the mercy of evaluation order against viewport.height or
-        // root.workspaceRows during the first frame after opening.
-        readonly property int openedRowIndex: {
-          for (var i = 0; i < root.workspaceRows.length; i++) {
-            if (root.workspaceRows[i].id === root.openedWorkspaceId) return i
-          }
-          return -1
+        // Scroll offset that puts row `index` on the viewport's vertical
+        // midpoint. This one function is the whole vertical coordinate
+        // system: it is the resting offset, and spaced a rowStride apart it
+        // is also the set of snap points, which together are what keep some
+        // row centred whenever nobody is actively scrolling.
+        //
+        // Note it is negative for row 0 whenever a row is shorter than the
+        // viewport. That is the point — the old model derived the travel
+        // limits from the column height, so 0 was the lowest offset it could
+        // reach and the first row could only ever sit against the top edge.
+        function centerPositionFor(index) {
+          return index * root.rowStride + root.rowHeight / 2 - viewport.height / 2
         }
 
-        // Scroll offset that puts the focused workspace's row in the middle
-        // of the viewport. KineticScroll clamps it into range.
-        readonly property real centeredPosition: viewport.openedRowIndex >= 0
-          ? viewport.openedRowIndex * root.rowStride + root.uniformRowHeight / 2 - viewport.height / 2
-          : 0
-
-        // Where the column sits relative to the viewport's top edge. When
-        // every row already fits there is nothing to scroll, so the column
-        // is simply centred as a block — clamping a scroll offset instead
-        // would pin it to the top, which is the exact bug the old unclamped
-        // centring was working around.
-        readonly property real columnOffset: vScroll.overflows
-          ? -vScroll.position
-          : (viewport.height - column.height) / 2 - vScroll.position
+        readonly property real columnOffset: -vScroll.position
 
         KineticScroll {
           id: vScroll
+          // contentSize is deliberately not set: the travel limits below are
+          // not "scroll the column through the viewport" but "centre the
+          // first row" to "centre the last row". viewportSize is still wanted
+          // for the rubber-band reach at those limits.
           viewportSize: viewport.height
-          contentSize: column.height
-          restPosition: viewport.centeredPosition
-          notchPixels: root.rowStride * 0.55
+          minPosition: viewport.centerPositionFor(0)
+          maxPosition: viewport.centerPositionFor(Math.max(0, root.workspaceRows.length - 1))
+          snapStride: root.rowStride
+          restPosition: viewport.centerPositionFor(root.selectedRow)
           // Undoes Hyprland's global touchpad scroll_factor (Omarchy
           // default 0.4) -- see the property's own comment in
           // KineticScroll.qml.
           dragScale: 4
+
+          // A swipe or a wheel step settling on a row *is* selecting it, so
+          // the selection follows the scroll as well as driving it.
+          onSnapped: function(index) {
+            var rows = root.workspaceRows
+            if (index >= 0 && index < rows.length) root.selectedWorkspaceId = rows[index].id
+          }
         }
+
+        // Everything that zooms, and nothing that shouldn't: the wheel handler
+        // below stays outside so it keeps covering the whole screen whatever
+        // the strip is doing, and the backdrop is outside the viewport
+        // entirely so it can fade on its own.
+        //
+        // Deliberately x/y/scale rather than a `transform: [Scale, Translate]`
+        // list. Transform lists post-multiply, so that pair maps a child point
+        // to s*(p + t) — the translation comes out scaled too — while the
+        // offsets above are derived for s*p + t. With transformOrigin at the
+        // top left, x/y/scale give exactly s*p + t and there is no order to
+        // get wrong.
+        Item {
+          id: zoomLayer
+          width: viewport.width
+          height: viewport.height
+          transformOrigin: Item.TopLeft
+          scale: root.zoomFactor
+          x: root.zoomOffset(root.zoomThumbX, root.zoomRealX)
+          y: root.zoomOffset(root.zoomThumbY, root.zoomRealY)
+          opacity: root.zoomReady ? 1 : 0
 
         Column {
           id: column
@@ -320,7 +672,10 @@ Item {
               required property var modelData
               required property int index
               width: column.width
-              height: root.uniformRowHeight
+              height: root.rowHeight
+
+              // How root.selectedRowScroll() reaches this row's horizontal axis.
+              property alias hScroll: rowScroll
 
               // Windows in real on-screen (left-to-right) order, so the
               // thumbnails either side of the focused one match how the
@@ -328,55 +683,102 @@ Item {
               readonly property var sortedToplevels: root.sortToplevelsBySpatialOrder(rowItem.modelData.toplevels.values)
               readonly property int focusedIndex: root.focusedIndexFor(rowItem.sortedToplevels)
 
+              readonly property bool current: rowItem.index === root.selectedRow
+
+              // Which thumbnail this row centres on. Only the centred row
+              // follows the live left/right selection; every other row stays
+              // parked on whatever Hyprland considers focused there, so
+              // arrowing onto it lands somewhere sensible rather than
+              // wherever the last row happened to be scrolled to.
+              readonly property int selectedIndex: rowItem.current
+                ? Math.max(0, Math.min(rowItem.sortedToplevels.length - 1, root.selectedApp))
+                : rowItem.focusedIndex
+
               // This row's top edge in viewport coordinates, and whether
               // that puts it close enough to matter. Rows are a uniform
               // height, so this is arithmetic rather than a live geometry
               // read — no dependency on delegates existing yet.
               readonly property real viewportY: rowItem.index * root.rowStride + viewport.columnOffset
               readonly property bool nearViewport: root.opened
-                && rowItem.viewportY + root.uniformRowHeight > -root.liveMargin
+                && rowItem.viewportY + root.rowHeight > -root.liveMargin
                 && rowItem.viewportY < viewport.height + root.liveMargin
 
-              // Bumped once by each thumbnail delegate as it's created (see
-              // thumb's Component.onCompleted below) purely so
-              // focusedCenterX has something to depend on across that
-              // moment. Repeater.itemAt(i) can still return null on the
-              // very first evaluation right after Repeater.count ticks up
-              // (delegate creation is deferred a beat past the count
-              // change), and since a null hit short-circuits before ever
-              // reading ".width", that first evaluation never touches a
-              // property that fires again later — the binding would
-              // otherwise go stale at whatever it computed during that gap
-              // (typically treating the focused thumbnail as zero-width)
-              // and never recompute once the real item exists.
-              property int thumbReadyTick: 0
+              // ---- the workspace's real geometry ----
+              //
+              // A row is a scaled replica of this workspace's monitor: the
+              // wallpaper is the monitor rectangle, and every window is drawn
+              // at its true size and offset within it. Nothing here reads a
+              // delegate's width, so none of it can go stale waiting for
+              // screencopy or for Repeater to catch up with its own count.
 
-              // Sum of widths (plus spacing) of every thumbnail before the
-              // focused one, so the row viewport knows where to scroll to
-              // put the focused thumbnail's center in the middle. Reads
-              // thumbRepeater items' widths directly so it stays reactive as
-              // real aspect ratios arrive asynchronously from screencopy.
-              readonly property real focusedCenterX: {
-                var _tick = rowItem.thumbReadyTick // establishes the dependency described above
-                var sum = 0
-                for (var i = 0; i < thumbRepeater.count; i++) {
-                  var it = thumbRepeater.itemAt(i)
-                  if (!it) continue
-                  if (i < rowItem.focusedIndex) sum += it.width + root.thumbSpacing
-                  else { sum += it.width / 2; break }
+              readonly property var monitor: rowItem.modelData.monitor
+
+              // Hyprland reports a monitor's size in *physical* pixels but
+              // window geometry in logical ones, so the monitor has to be
+              // divided back down before the two can be compared at all.
+              // Read through lastIpcObject when the typed property is absent:
+              // getting this wrong is not a small error. Falling back to 1 on
+              // a 2x monitor would draw the monitor rectangle at the right
+              // size but every window at half of it.
+              readonly property real monScale: {
+                var mon = rowItem.monitor
+                if (!mon) return 1
+                var s = Number(mon.scale)
+                if (!isFinite(s) || s <= 0) {
+                  var ipc = mon.lastIpcObject
+                  s = ipc ? Number(ipc.scale) : NaN
                 }
-                return sum
+                return (isFinite(s) && s > 0) ? s : 1
+              }
+              readonly property real monX: rowItem.monitor ? rowItem.monitor.x : 0
+              readonly property real monY: rowItem.monitor ? rowItem.monitor.y : 0
+              readonly property real monW: (rowItem.monitor && rowItem.monitor.width > 0)
+                ? rowItem.monitor.width / rowItem.monScale : 0
+              readonly property real monH: (rowItem.monitor && rowItem.monitor.height > 0)
+                ? rowItem.monitor.height / rowItem.monScale : 0
+
+              // Logical workspace pixels to row pixels. The row is the
+              // monitor's height, so this is the one scale everything in the
+              // row — wallpaper and windows alike — is drawn at.
+              readonly property real geomScale: rowItem.monH > 0 ? root.rowHeight / rowItem.monH : 0
+
+              // Omari mode is a scrolling layout, so a workspace's windows
+              // routinely run past both edges of the monitor they are on —
+              // that is the whole point of it. The strip is therefore the
+              // union of the monitor and every window, and it is what scrolls
+              // horizontally; the monitor rectangle just sits inside it,
+              // marking the part you would actually be looking at.
+              readonly property var strip: {
+                var left = rowItem.monX
+                var right = rowItem.monX + rowItem.monW
+                var vals = rowItem.sortedToplevels
+                for (var i = 0; i < vals.length; i++) {
+                  var r = root.rectFor(vals[i])
+                  if (!r) continue
+                  if (r.x < left) left = r.x
+                  if (r.x + r.w > right) right = r.x + r.w
+                }
+                return { left: left, right: right }
               }
 
-              // The monitor this workspace lives on, so the background
-              // thumbnail's shape always matches the real screen instead of
-              // an arbitrary guess.
-              readonly property real monitorAspect: {
-                var mon = rowItem.modelData.monitor
-                return (mon && mon.width > 0 && mon.height > 0)
-                  ? (mon.width / mon.height)
-                  : root.fallbackAspect
+              // Where a window sits in the row, in row pixels. Windows with
+              // no geometry yet fall back to filling the monitor rectangle —
+              // visible and roughly right beats vanishing.
+              function rectInRow(toplevel) {
+                var r = root.rectFor(toplevel)
+                if (!r) r = { x: rowItem.monX, y: rowItem.monY, w: rowItem.monW, h: rowItem.monH }
+                return {
+                  x: (r.x - rowItem.strip.left) * rowItem.geomScale,
+                  y: (r.y - rowItem.monY) * rowItem.geomScale,
+                  w: r.w * rowItem.geomScale,
+                  h: r.h * rowItem.geomScale
+                }
               }
+
+
+              // For captureZoom, which needs the thumbnail's real on-screen box
+              // and cannot reach into the Repeater from outside.
+              function thumbItemAt(i) { return thumbRepeater.itemAt(i) }
 
               // A fresh overview always opens centred on the focused window,
               // never wherever the last one happened to be left scrolled to —
@@ -386,31 +788,34 @@ Item {
                 function onOpenedChanged() { rowScroll.reset() }
               }
 
-              Text {
-                id: rowLabel
-                anchors.top: parent.top
-                anchors.left: parent.left
-                text: rowItem.modelData.name || ("Workspace " + rowItem.modelData.id)
-                color: Color.foreground
-                opacity: 0.6
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-              }
+              // Deliberately unlabelled. A workspace name over every row is
+              // the one piece of chrome that reads as a *list* of workspaces;
+              // without it the rows read as the desktops themselves, which is
+              // the whole illusion. Which row you are on is already carried by
+              // it being the centred one, and which window by its ring.
 
-              // Background wallpaper thumbnail: centered in the row, fixed
-              // behind the app thumbnails (doesn't pan with them), slightly
-              // larger, with a drop shadow against the solid overview
-              // background. Sized from root.rowHeight and the workspace's
-              // real monitor aspect ratio (never from the image's own
-              // decoded size) so this Item's geometry is stable from the
-              // first frame — only the pixmap swaps in once decoded, never
-              // the layout.
+              // The wallpaper thumbnail: the monitor rectangle, centred in the
+              // row and *fixed* there. It deliberately sits outside the
+              // scrolling strip below, so panning a workspace's windows slides
+              // them across a wallpaper that stays put — the way the real
+              // desktop behaves under a scrolling layout, where moving through
+              // the columns never moves the background.
+              //
+              // At rest the strip is positioned so the monitor's own slice of
+              // it lands exactly here (see rowViewport.restX), so the two agree
+              // until you scroll away. Declared before rowViewport so it draws
+              // behind the windows, and outside it so its drop shadow is not
+              // clipped away at the row's top and bottom edges.
+              //
+              // Sized from the monitor, never from the image's decoded size, so
+              // the geometry is stable from the first frame — only the pixmap
+              // swaps in later, never the layout.
               Item {
-                id: bgThumbBox
+                id: monitorRect
                 anchors.horizontalCenter: parent.horizontalCenter
-                y: rowLabel.implicitHeight + Style.space(10) + (root.rowHeight - height) / 2
-                height: root.rowHeight * root.bgOversize
-                width: height * rowItem.monitorAspect
+                y: 0
+                width: rowItem.monW * rowItem.geomScale
+                height: root.rowHeight
                 layer.enabled: true
                 layer.effect: MultiEffect {
                   shadowEnabled: true
@@ -429,37 +834,63 @@ Item {
                   cache: true
                   smooth: true
                   visible: root.backgroundImagePath !== ""
-                  // Decode the wallpaper at thumbnail size rather than at
-                  // its native resolution — a 4K background costs ~32MB of
-                  // texture and a full-size decode otherwise, for something
-                  // drawn a few hundred pixels tall. Every row asks for the
-                  // same height, so they all share one cached texture.
-                  sourceSize.height: Math.round(root.rowHeight * root.bgOversize * Screen.devicePixelRatio)
+                  // Decode the wallpaper at thumbnail size rather than at its
+                  // native resolution — a 4K background costs ~32MB of texture
+                  // and a full-size decode otherwise, for something drawn a few
+                  // hundred pixels tall. Every row asks for the same height, so
+                  // they all share one cached texture.
+                  sourceSize.height: Math.round(root.rowHeight * Screen.devicePixelRatio)
                 }
               }
 
               Item {
                 id: rowViewport
-                anchors.top: rowLabel.bottom
-                anchors.topMargin: Style.space(10)
-                anchors.left: parent.left
-                anchors.right: parent.right
-                height: root.rowHeight
+                anchors.fill: parent
                 clip: true
 
-                // When the row's thumbnails all fit there is nothing to
-                // scroll, so the strip is offset to put the focused
-                // thumbnail on the viewport midpoint — which lines up with
-                // the background thumbnail's horizontal center. Once it
-                // overflows, that same position becomes the scroller's
-                // resting offset and the user can drag away from it.
-                readonly property real centeredX: rowViewport.width / 2 - rowItem.focusedCenterX
+                readonly property real contentWidth:
+                  (rowItem.strip.right - rowItem.strip.left) * rowItem.geomScale
+
+                // Where the strip comes to rest: the *monitor* rectangle
+                // centred, not the selected window. That is what lines every
+                // row's wallpaper up down the middle of the screen and makes a
+                // row show what you would actually be looking at were you on
+                // that workspace — windows fall where the layout puts them,
+                // spilling off both edges as they do on a scrolling layout.
+                //
+                // Nudged off that only as far as it must be to keep the ringed
+                // window on screen, for when left/right has walked past the
+                // part of the strip the monitor covers.
+                readonly property real restX: {
+                  var monCentre = (rowItem.monX - rowItem.strip.left + rowItem.monW / 2)
+                    * rowItem.geomScale
+                  var pos = monCentre - rowViewport.width / 2
+                  var vals = rowItem.sortedToplevels
+                  var i = rowItem.selectedIndex
+                  if (i < 0 || i >= vals.length) return pos
+                  var r = rowItem.rectInRow(vals[i])
+                  if (r.x < pos) return r.x
+                  if (r.x + r.w > pos + rowViewport.width) return r.x + r.w - rowViewport.width
+                  return pos
+                }
 
                 KineticScroll {
                   id: rowScroll
                   viewportSize: rowViewport.width
-                  contentSize: rowContent.width
-                  restPosition: rowItem.focusedCenterX - rowViewport.width / 2
+                  // Not "fit the content inside the viewport": the strip is
+                  // meant to overhang both edges, and clamping it to the
+                  // viewport is exactly what would drag the monitor rectangle
+                  // off centre. The travel runs from the strip's own left edge
+                  // to its right one, widened to always contain restX.
+                  minPosition: Math.min(0, rowViewport.restX)
+                  maxPosition: Math.max(rowViewport.contentWidth - rowViewport.width,
+                                        rowViewport.restX)
+                  // Left/right arrows move rowItem.selectedIndex, which moves
+                  // this, which glides the strip along. The horizontal axis
+                  // stays free-scrolling (no snapStride): windows are
+                  // different widths, and a swipe across a row should be able
+                  // to stop wherever it likes.
+                  restPosition: rowViewport.restX
                   notchPixels: root.rowHeight * 0.6
                   // Undoes Hyprland's global touchpad scroll_factor (Omarchy
                   // default 0.4) -- see the property's own comment in
@@ -467,10 +898,20 @@ Item {
                   dragScale: 4
                 }
 
-                Row {
+                // The strip: every window on the workspace at its real position
+                // relative to the monitor, panned as one over the fixed
+                // wallpaper above. Windows are placed rather than packed, so
+                // this is a plain Item and not a Row — the layout is the
+                // workspace's own.
+                Item {
                   id: rowContent
-                  x: rowScroll.overflows ? -rowScroll.position : rowViewport.centeredX
-                  spacing: root.thumbSpacing
+                  // No "does it overflow" special case any more: when a
+                  // workspace's windows all sit inside its monitor the travel
+                  // limits collapse onto restX, so this is the centred
+                  // position by construction.
+                  x: -rowScroll.position
+                  width: rowViewport.contentWidth
+                  height: rowViewport.height
 
                   Repeater {
                     id: thumbRepeater
@@ -479,47 +920,53 @@ Item {
                     Rectangle {
                       id: thumb
                       required property var modelData
+                      required property int index
 
-                      readonly property real aspect: capture.hasContent && capture.sourceSize.height > 0
-                        ? capture.sourceSize.width / capture.sourceSize.height
-                        : root.fallbackAspect
+                      readonly property var geom: rowItem.rectInRow(thumb.modelData)
+                      x: thumb.geom.x
+                      y: thumb.geom.y
 
-                      // Deliberately not animated. The real aspect ratio
-                      // arrives asynchronously, a frame or two after the
-                      // overview opens, for every thumbnail at once —
-                      // easing each width change relayouts the Row and
-                      // re-runs focusedCenterX on every frame of every
-                      // animation, precisely during the frames the overview
-                      // most needs to be cheap. Unanimated, the correction
-                      // lands before there is anything to see.
-                      width: Math.round(root.rowHeight * aspect)
-                      height: root.rowHeight
+                      // Every row rings the window it is centred on — its own
+                      // focused one, or on the centred row whatever left/right
+                      // has moved to. Unringed windows get no border at all:
+                      // an outline on all of them turns the row into a strip
+                      // of framed tiles, where the point is a row of windows.
+                      readonly property bool ringed: thumb.index === rowItem.selectedIndex
+                        || hoverArea.containsMouse
+
+                      // Only the centred row's ring is the *keyboard* ring, so
+                      // only that one is worth the accent; the others are
+                      // stating a fact about their workspace, not a selection,
+                      // and a neutral grey is enough to say it.
+                      readonly property bool active: thumb.ringed
+                        && (rowItem.current || hoverArea.containsMouse)
+
+                      // Size comes from Hyprland's own geometry, not from the
+                      // screencopy buffer's aspect ratio: the buffer arrives a
+                      // frame or two late and would relayout the whole row
+                      // when it did, precisely during the frames the overview
+                      // most needs to be cheap. The window's real rectangle is
+                      // known before the first pixel is captured.
+                      width: thumb.geom.w
+                      height: thumb.geom.h
                       radius: Style.space(6)
                       color: Color.background
-                      // 3px on hover, not 2: the live capture below sits
-                      // right up to this same edge (anchors.fill, inset only
-                      // by the margin fixed below), so anything short of a
-                      // clearly wider ring reads as noise against the video
-                      // rather than a highlight.
-                      border.width: hoverArea.containsMouse ? 3 : 1
-                      border.color: hoverArea.containsMouse
+                      border.width: thumb.ringed ? Style.space(2) : 0
+                      border.color: thumb.active
                         ? Color.accent
-                        : Util.alpha(Color.foreground, 0.15)
+                        : Util.alpha(Color.foreground, 0.4)
                       clip: true
-
-                      Component.onCompleted: rowItem.thumbReadyTick += 1
 
                       ScreencopyView {
                         id: capture
                         anchors.fill: parent
                         // Without this inset the capture paints edge-to-edge
-                        // over the border above, in both states -- hover was
-                        // firing correctly (containsMouse, the click, the
-                        // border binding all worked) but the video was
-                        // visually covering the ring the whole time. 3
-                        // matches the hover border width so the frame reads
-                        // the same size whether or not it's covering video.
-                        anchors.margins: 3
+                        // over the border above -- hover was firing correctly
+                        // (containsMouse, the click, the border binding all
+                        // worked) but the video was visually covering the ring
+                        // the whole time. Tracking border.width means an
+                        // unringed thumbnail is pure window, edge to edge.
+                        anchors.margins: thumb.border.width
                         captureSource: thumb.modelData.wayland
                         // Live only while this row is at or near the
                         // viewport. Every thumbnail is its own screencopy
@@ -541,74 +988,40 @@ Item {
                         Component.onCompleted: if (!capture.live) capture.captureFrame()
                       }
 
-                      Rectangle {
-                        anchors.left: parent.left
-                        anchors.right: parent.right
-                        anchors.bottom: parent.bottom
-                        height: titleLabel.implicitHeight + Style.space(8)
-                        color: Qt.rgba(0, 0, 0, 0.55)
-
-                        Text {
-                          id: titleLabel
-                          anchors.left: parent.left
-                          anchors.right: parent.right
-                          anchors.verticalCenter: parent.verticalCenter
-                          anchors.margins: Style.space(8)
-                          text: thumb.modelData.title
-                          color: "#ffffff"
-                          elide: Text.ElideRight
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.bodySmall
-                        }
-                      }
+                      // No title bar over the bottom of the thumbnail. At this
+                      // size every window already shows its own titlebar, tab
+                      // strip or header, so the overlay was a second, uglier
+                      // title stacked on the real one — and it covered the
+                      // bottom of the very content that makes a window
+                      // recognisable at a glance.
 
                       MouseArea {
                         id: hoverArea
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.focusToplevel(thumb.modelData)
+                        onClicked: root.activateToplevel(thumb.modelData, rowItem.index, thumb.index)
                       }
                     }
                   }
                 }
 
-                // Wheel-only overlay: acceptedButtons: NoButton means clicks
-                // and hover pass straight through to the thumbnails
-                // underneath, so this only ever intercepts scrolling. It
-                // sees an event only when the viewport-level handler below
-                // has already decided the gesture belongs to this axis.
-                MouseArea {
-                  anchors.fill: parent
-                  acceptedButtons: Qt.NoButton
-                  hoverEnabled: false
-                  onWheel: function(wheel) {
-                    if (!rowScroll.overflows) { wheel.accepted = false; return }
-
-                    if (!root.isTouchpadWheel(wheel)) {
-                      if (Math.abs(wheel.angleDelta.x) < Math.abs(wheel.angleDelta.y)) {
-                        wheel.accepted = false
-                        return
-                      }
-                      rowScroll.stepBy(-wheel.angleDelta.x / 120)
-                      wheel.accepted = true
-                      return
-                    }
-
-                    if (wheel.phase === Qt.ScrollEnd) rowScroll.endDrag()
-                    else rowScroll.dragBy(-wheel.pixelDelta.x)
-                    wheel.accepted = true
-                  }
-                }
+                // No per-row wheel handler here any more. One that only fires
+                // when the pointer is over its own row makes which row scrolls
+                // depend on where the mouse was left — see
+                // root.selectedRowScroll(), which the single handler at the
+                // viewport level uses instead.
               }
             }
           }
         }
+        } // zoomLayer
 
-        // Topmost wheel handler, and so the one that arbitrates: it takes
-        // the gesture when the axis lock says vertical and declines it
-        // (accepted = false, which lets the event fall through to the row
-        // strip underneath) when it says horizontal.
+        // The only wheel handler, and so the one that routes both axes: it
+        // drives the workspace list itself when the axis lock says vertical,
+        // and the centred row's strip when it says horizontal. It covers the
+        // whole viewport and sits outside zoomLayer, so it keeps seeing every
+        // gesture whatever the strip underneath is scaled or scrolled to.
         MouseArea {
           anchors.fill: parent
           acceptedButtons: Qt.NoButton
@@ -616,7 +1029,9 @@ Item {
           onWheel: function(wheel) {
             if (!root.isTouchpadWheel(wheel)) {
               if (Math.abs(wheel.angleDelta.y) < Math.abs(wheel.angleDelta.x)) {
-                wheel.accepted = false
+                var hWheel = root.selectedRowScroll()
+                if (hWheel) hWheel.stepBy(-wheel.angleDelta.x / 120)
+                wheel.accepted = true
                 return
               }
               vScroll.stepBy(-wheel.angleDelta.y / 120)
@@ -630,14 +1045,31 @@ Item {
             }
             gestureIdle.restart()
 
-            if (root.gestureAxis === "x") { wheel.accepted = false; return }
+            if (root.gestureAxis === "x") {
+              var hDrag = root.selectedRowScroll()
+              if (wheel.phase === Qt.ScrollEnd) {
+                root.gestureAxis = ""
+                gestureIdle.stop()
+                if (hDrag) hDrag.endDrag()
+              } else if (hDrag) {
+                hDrag.dragBy(-wheel.pixelDelta.x)
+              }
+              wheel.accepted = true
+              return
+            }
 
             if (wheel.phase === Qt.ScrollEnd) {
               root.gestureAxis = ""
               gestureIdle.stop()
               vScroll.endDrag()
             } else {
-              vScroll.dragBy(-wheel.pixelDelta.y)
+              // Not negated, unlike every other axis here: two fingers drag
+              // the *stack of workspaces* rather than the view over it, so
+              // pushing up brings the row below into the centre. The mouse
+              // wheel above keeps the opposite, conventional sense — which is
+              // the same split most people already run between a touchpad set
+              // to natural scrolling and a wheel that is not.
+              vScroll.dragBy(wheel.pixelDelta.y)
             }
             wheel.accepted = true
           }
