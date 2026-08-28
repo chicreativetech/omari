@@ -52,6 +52,7 @@ Item {
     // row than last time; this covers reopening on the same row, where the
     // focused window may still have changed underneath us.
     root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
+    root.refreshGeometry()
     bgPathProc.running = true
     root.clearZoom()
     // Start fully zoomed in, onto nothing yet: the surface has to exist and be
@@ -74,12 +75,63 @@ Item {
   function close() {
     root.opened = false
     root.gestureAxis = ""
+    geometryRefresh.stop()
     zoomOpenTimer.stop()
     root.clearZoom()
     vScroll.reset()
   }
   function toggle() { if (root.opened) root.close(); else root.open() }
   function ping() { return "ok" }
+
+  // ---- window geometry ----
+  //
+  // Every rectangle in a row -- the strip, the travel limits, each thumbnail's
+  // size and place -- is derived from Hyprland's own `at`/`size` for that
+  // window, read off HyprlandToplevel.lastIpcObject. That field is filled in
+  // by an IPC *query* and by nothing else: Quickshell builds a toplevel from
+  // the `openwindow` event with no geometry at all, and one built by the query
+  // at startup keeps the geometry it had at that moment however many times the
+  // window has moved since. Neither is a small error here. rectFor returns null
+  // for a window with no geometry and rectInRow falls back to the monitor
+  // rectangle, so a workspace's windows stack on the same spot at the same
+  // size: only the topmost is visible, and it is the one every click lands on
+  // whichever thumbnail was aimed at -- which is exactly what a shell that has
+  // been up long enough for its windows to have been opened after it shows.
+  //
+  // So query on the way in, and again whenever the layout moves underneath.
+  // The reply is asynchronous, but it lands in a couple of milliseconds --
+  // well inside the two frames zoomOpenTimer holds the strip invisible for --
+  // and every rectangle in here is a binding over lastIpcObject, so the rows
+  // lay themselves out again the moment it arrives.
+  function refreshGeometry() { Hyprland.refreshToplevels() }
+
+  // Events that can move or resize a window, and so invalidate the geometry
+  // the rows are drawn from. Deliberately a list rather than "any event": a
+  // busy terminal emits windowtitle continuously, and re-querying on those
+  // would re-evaluate every rectangle in the overview several times a second,
+  // against the very frames a smooth scroll needs.
+  readonly property var geometryEvents: [
+    "openwindow", "closewindow", "movewindow", "movewindowv2",
+    "changefloatingmode", "fullscreen", "pin", "moveworkspace", "monitoradded",
+    "monitorremoved", "configreloaded"
+  ]
+
+  Connections {
+    target: Hyprland
+    enabled: root.opened
+    function onRawEvent(event) {
+      if (root.geometryEvents.indexOf(event.name) !== -1) geometryRefresh.restart()
+    }
+  }
+
+  // Coalesces a burst into one query: closing a single window in a scrolling
+  // layout emits a closewindow and then a movewindow per column it shifted,
+  // and one query answers all of them.
+  Timer {
+    id: geometryRefresh
+    interval: 50
+    onTriggered: root.refreshGeometry()
+  }
 
   Process {
     id: bgPathProc
