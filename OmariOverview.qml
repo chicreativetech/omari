@@ -55,33 +55,89 @@ Item {
     root.refreshGeometry()
     bgPathProc.running = true
     root.clearZoom()
-    // Start fully zoomed in, onto nothing yet: the surface has to exist and be
-    // laid out before there is a thumbnail to measure, so zoomOpenTimer does
-    // the measuring a couple of frames from now. Until then the strip is held
-    // invisible and the backdrop is fully transparent, so what shows through
-    // is the real desktop — which is exactly the frame the zoom-out should
-    // start from anyway.
+    // Start fully zoomed in, onto nothing yet: there is no thumbnail to
+    // measure until the surface has been laid out, so zoomOpener does the
+    // measuring on the first frame that is actually drawn. Until then the
+    // strip is held invisible and the backdrop is fully transparent, so what
+    // shows through is the real desktop — which is exactly the frame the
+    // zoom-out should start from anyway.
     root.zoomProgress = 1
     root.zoomReady = false
+    root.leaving = false
+    root.grabsKeyboard = true
+    root.exitOpacity = 1
     root.opened = true
     root.gestureAxis = ""
     vScroll.reset()
-    zoomOpenTimer.begin()
+  }
+
+  // The user-facing dismissal, and what the host's hide() reaches: fade, then
+  // tear down. A hard unmap reads as a glitch rather than as leaving — one
+  // frame an opaque backdrop, the next the desktop — and by the time anyone
+  // cancels, the surface is long past the expensive frames that open it and
+  // has 60Hz to spend on a fade.
+  //
+  // `opened` goes false here rather than at the end of the fade, and the
+  // surface is held up by `leaving` instead. It is what the host answers
+  // "is this plugin open?" with, so leaving it true through the fade would
+  // swallow a swipe that arrives during it — and this is precisely where one
+  // arrives, since the fade is the tail of the gesture that closed it. Now
+  // that swipe reaches open(), which cancels the fade on a surface that never
+  // unmapped: the overview comes back instantly.
+  //
+  // The keyboard grab goes back here too rather than at the end, so the window
+  // underneath is live again the moment you ask to leave.
+  function close() {
+    if (!root.opened || root.leaving) return
+    root.opened = false
+    root.leaving = true
+    root.grabsKeyboard = false
+    exitFade.restart()
   }
 
   // Reset rather than just hide: a flick still coasting when the overview
   // closes would otherwise keep a FrameAnimation ticking behind an invisible
   // surface, and would still be mid-glide the next time it opens.
-  function close() {
+  function finish() {
+    exitFade.stop()
+    handOffTimer.stop()
     root.opened = false
+    root.leaving = false
+    root.grabsKeyboard = true
+    root.exitOpacity = 1
     root.gestureAxis = ""
     geometryRefresh.stop()
-    zoomOpenTimer.stop()
     root.clearZoom()
     vScroll.reset()
   }
+
   function toggle() { if (root.opened) root.close(); else root.open() }
   function ping() { return "ok" }
+
+  // ---- leaving ----
+  //
+  // True from the moment a dismissal or an activation starts until the
+  // surface actually goes away. Everything that would otherwise fire twice —
+  // a second swipe during the fade, Escape on top of a click — checks it.
+  property bool leaving: false
+
+  // Whether this surface still holds the keyboard grab. Dropped before a
+  // focus dispatch goes out; see handOff.
+  property bool grabsKeyboard: true
+
+  // Multiplied into everything the overview draws while it leaves.
+  property real exitOpacity: 1
+
+  NumberAnimation {
+    id: exitFade
+    target: root
+    property: "exitOpacity"
+    from: 1
+    to: 0
+    duration: 110
+    easing.type: Easing.InQuad
+    onFinished: root.finish()
+  }
 
   // ---- window geometry ----
   //
@@ -100,7 +156,7 @@ Item {
   //
   // So query on the way in, and again whenever the layout moves underneath.
   // The reply is asynchronous, but it lands in a couple of milliseconds --
-  // well inside the two frames zoomOpenTimer holds the strip invisible for --
+  // well inside the first frames of the surface being mapped --
   // and every rectangle in here is a binding over lastIpcObject, so the rows
   // lay themselves out again the moment it arrives.
   function refreshGeometry() { Hyprland.refreshToplevels() }
@@ -383,8 +439,7 @@ Item {
   }
 
   function clearZoom() {
-    zoomOutAnim.stop()
-    zoomInAnim.stop()
+    zoomRamp.halt()
     root.pendingActivation = null
     root.zoomProgress = 0
     root.zoomScale = 1
@@ -395,21 +450,17 @@ Item {
     root.zoomReady = true
   }
 
-  // The dive runs first and the focus goes out at the end of it, once the
-  // overlay has been torn down — see focusToplevel for why that order is not
-  // negotiable. Dispatching early to overlap the workspace switch with the
-  // animation was tried and is wrong: the focus lands while the keyboard grab
-  // is still held, and the unmap takes it straight back.
+  // The dive runs first and the focus goes out at the end of it — see
+  // focusToplevel for what that order buys and what it costs.
   function activateToplevel(toplevel, rowIndex, appIndex) {
     if (!toplevel) return
-    if (root.pendingActivation) return
+    if (root.pendingActivation || root.leaving) return
     if (!root.captureZoom(rowIndex, appIndex)) {
       root.focusToplevel(toplevel)
       return
     }
     root.pendingActivation = toplevel
-    root.zoomProgress = 0
-    zoomInAnim.restart()
+    zoomRamp.run(0, 1, 200, root.finishActivation)
   }
 
   function finishActivation() {
@@ -418,75 +469,116 @@ Item {
     root.focusToplevel(toplevel)
   }
 
-  // The capture needs a surface that has been *laid out*, not merely one whose
-  // delegates exist. Measuring too early is not a near miss: while the layer
-  // surface is still unsized panel.height is 0, so rowHeight sits on its floor
-  // and a thumbnail measures a fraction of its eventual size — which lands in
-  // zoomScale as a factor of seven rather than two and flings the strip off
-  // screen. Waiting a fixed couple of frames is not enough either, since the
-  // compositor decides when the surface gets its size.
+  // Measures the zoom and starts the fall-back on the first frame the
+  // compositor could actually show, and not one frame later.
   //
-  // So: poll, and require a real size to have held for two consecutive ticks,
-  // which gives Column a polish pass in between to position the rows that
-  // mapToItem is about to be asked about.
-  Timer {
-    id: zoomOpenTimer
-    interval: 16
-    repeat: true
-    property int ticks: 0
-    property bool wasSized: false
-
-    function begin() {
-      zoomOpenTimer.ticks = 0
-      zoomOpenTimer.wasSized = false
-      zoomOpenTimer.restart()
-    }
-
+  // This used to be a 16ms Timer that waited for panel.height and
+  // column.height to be non-zero on two consecutive ticks, and it was starved
+  // by exactly the work it was waiting on. Opening the overview means mapping
+  // a fresh full-screen layer surface, and the two frames that takes were
+  // measured at ~200ms each -- a cost in the surface itself, not in what is
+  // drawn on it: taking the row shadows out, then the screencopy streams, then
+  // the wallpaper, each changed it by nothing. So the timer's ticks landed
+  // around half a second after the swipe, and the strip was held invisible for
+  // every one of them. That half second of nothing is what made the overview
+  // feel slow to open; it was never the animation.
+  //
+  // A FrameAnimation ticks with the renderer instead, so its first trigger is
+  // the first frame. Measuring there needs the scene laid out, which it is
+  // from the second summon onwards because the plugin is keepLoaded and the
+  // rows survive between them. On the very first open of a session it is not,
+  // and rather than hold the surface blank for another ~200ms frame, the zoom
+  // is skipped and the overview simply appears whole.
+  FrameAnimation {
+    id: zoomOpener
+    running: root.opened && !root.zoomReady
     onTriggered: {
-      if (!root.opened) { zoomOpenTimer.stop(); return }
-      zoomOpenTimer.ticks++
-
-      var sized = panel.height > 0 && column.height > 0
-      if (sized && zoomOpenTimer.wasSized) {
-        zoomOpenTimer.stop()
-        if (root.captureZoom(root.selectedRow, root.selectedApp)) {
-          root.zoomReady = true
-          zoomOutAnim.restart()
-        } else {
-          root.clearZoom()
-        }
-        return
-      }
-      zoomOpenTimer.wasSized = sized
-
-      // Never leave the strip hidden waiting for a size that isn't coming:
-      // give up after a quarter second and just show the overview.
-      if (zoomOpenTimer.ticks > 15) {
-        zoomOpenTimer.stop()
+      if (root.captureZoom(root.selectedRow, root.selectedApp)) {
+        root.zoomReady = true
+        // One capped step in, rather than at the very start. The frame this
+        // runs for is the first one the compositor can show, and at progress 1
+        // the strip is a pixel-exact stand-in for the window it covers — so
+        // starting the ramp at 1 spends that hard-won first frame drawing
+        // something indistinguishable from the desktop that was already there,
+        // and the earliest anything can be seen to move is the frame after it,
+        // which is the other expensive one. Starting a step in means the first
+        // thing drawn is the overview already pulling back. It is not a cheat
+        // either: a good fraction of a second of real time passed while the
+        // surface was being mapped, which is a great deal more than the one
+        // frame of ramp it is credited with.
+        zoomRamp.run(1, 0, 260, null, zoomRamp.maxStep)
+      } else {
         root.clearZoom()
       }
     }
   }
 
-  NumberAnimation {
-    id: zoomOutAnim
-    target: root
-    property: "zoomProgress"
-    from: 1
-    to: 0
-    duration: 260
-    easing.type: Easing.OutCubic
-  }
+  // Both zooms run through here rather than through a NumberAnimation, and
+  // the reason is the same two expensive frames.
+  //
+  // A wall-clock animation advances by however long the last frame took, so a
+  // 260ms zoom started for the first frame of a fresh surface is simply over
+  // by the time the second one is drawn: the overview snapped into place
+  // instead of falling back into it, and the transition the animation exists
+  // to show was never on screen. Capping how far a single frame may carry the
+  // ramp turns that into a slower zoom rather than no zoom.
+  //
+  // On a healthy 60Hz frame the cap is nowhere near reached (16ms of 260 is a
+  // sixteenth) and this is exactly the animation it replaces.
+  FrameAnimation {
+    id: zoomRamp
+    running: false
+    property real fromValue: 0
+    property real toValue: 0
+    property real durationMs: 260
+    property real t: 0
+    property var whenDone: null
 
-  NumberAnimation {
-    id: zoomInAnim
-    target: root
-    property: "zoomProgress"
-    from: 0
-    to: 1
-    duration: 200
-    easing.type: Easing.InCubic
-    onFinished: root.finishActivation()
+    // A sixth of the ramp: the slowest frame imaginable still leaves five
+    // more steps of visible motion after it.
+    readonly property real maxStep: 1 / 6
+
+    // `head` starts the ramp already that far along, for a ramp whose first
+    // frame is also the first frame anyone can see.
+    function run(a, b, ms, done, head) {
+      zoomRamp.fromValue = a
+      zoomRamp.toValue = b
+      zoomRamp.durationMs = Math.max(1, ms)
+      zoomRamp.whenDone = done || null
+      zoomRamp.t = head || 0
+      root.zoomProgress = a + (b - a) * zoomRamp.eased(zoomRamp.t)
+      zoomRamp.restart()
+    }
+
+    // Stops without running the completion: for clearZoom, which is undoing
+    // the ramp rather than finishing it.
+    function halt() {
+      zoomRamp.whenDone = null
+      zoomRamp.stop()
+    }
+
+    // OutCubic falling back into the overview, InCubic diving into a window --
+    // the pair the two NumberAnimations carried, written out because a
+    // FrameAnimation has no easing curve of its own.
+    function eased(x) {
+      return zoomRamp.toValue < zoomRamp.fromValue
+        ? 1 - Math.pow(1 - x, 3)
+        : x * x * x
+    }
+
+    onTriggered: {
+      // frameTime is seconds since the previous frame.
+      var step = Math.min(zoomRamp.frameTime * 1000 / zoomRamp.durationMs,
+                          zoomRamp.maxStep)
+      zoomRamp.t = Math.min(1, zoomRamp.t + step)
+      root.zoomProgress = zoomRamp.fromValue
+        + (zoomRamp.toValue - zoomRamp.fromValue) * zoomRamp.eased(zoomRamp.t)
+      if (zoomRamp.t < 1) return
+      zoomRamp.stop()
+      var done = zoomRamp.whenDone
+      zoomRamp.whenDone = null
+      if (done) done()
+    }
   }
 
   // ---- scroll input routing ----
@@ -597,10 +689,10 @@ Item {
   // used to run here: activate() only asks for keyboard focus and leaves it
   // up to the compositor whether that also raises the window's workspace,
   // and doing it while this overlay still holds exclusive keyboard focus
-  // (WlrKeyboardFocus.Exclusive above) races root.close() unmapping that
-  // same surface. Hyprland's own focus dispatcher switches the active
-  // workspace to the window's as an intrinsic part of focusing it, so this
-  // reaches both the app and its workspace deterministically.
+  // races the unmap of that same surface. Hyprland's own focus dispatcher
+  // switches the active workspace to the window's as an intrinsic part of
+  // focusing it, so this reaches both the app and its workspace
+  // deterministically.
   //
   // Shells out to `hyprctl dispatch` instead of calling Quickshell's own
   // Hyprland.dispatch() QML method: that method silently has no effect here,
@@ -616,56 +708,92 @@ Item {
   // overview closing and the workspace actually changing. Nothing on this
   // command line needs a shell: no globbing, no variables, no PATH lookup
   // beyond /usr/bin, which the shell process already has.
-  function dispatchFocus(hyprlandToplevel) {
+  //
+  // The order around that dispatch is the delicate part: hand the keyboard
+  // grab back, dispatch, and only *then* unmap, a beat later. It matters in
+  // both directions and this is the only order that satisfies both.
+  //
+  // Dispatching while the grab is still held does not stick: Hyprland restores
+  // focus to whatever held it before the overlay opened when this surface
+  // unmaps, which undoes it. That is why the old code closed first. But
+  // closing first means the unmap happens before the workspace switch has
+  // landed, and what is behind the overlay at that moment is still the
+  // workspace being left — so there was a flash of the old desktop between the
+  // dive ending and the new workspace arriving.
+  //
+  // Setting keyboardFocus to None gives the grab back on its own, without
+  // unmapping. Hyprland has already returned focus by the time the dispatch
+  // goes out, so the dispatch is the last word, and the surface can stay up
+  // across the switch. It is holding its final zoomed frame while it does —
+  // the destination window at real size in its real place — so what it covers
+  // is exactly the switch.
+  function handOff(dispatchArg) {
+    if (root.leaving) return
+    root.opened = false
+    root.leaving = true
+    root.grabsKeyboard = false
+    Quickshell.execDetached(["hyprctl", "dispatch", dispatchArg])
+    // A completed dive needs no fade: at full zoom the strip *is* the
+    // destination window at its real size and place, so the overlay is already
+    // indistinguishable from what it is about to become and holding it is the
+    // whole trick. Anything else — the empty row, or a window whose thumbnail
+    // could not be measured to dive into — is still showing the overview, and
+    // that has to go somewhere rather than be cut away.
+    if (root.zoomProgress < 0.999) exitFade.restart()
+    handOffTimer.restart()
+  }
+
+  // Long enough for `hyprctl dispatch` to spawn, talk to Hyprland and the
+  // switch to be composited — hyprctl itself is ~10ms, and the surface is
+  // invisible against the destination for the whole wait, so erring long
+  // costs nothing while erring short brings the flash back.
+  Timer {
+    id: handOffTimer
+    interval: 110
+    onTriggered: root.finish()
+  }
+
+  function focusToplevel(hyprlandToplevel) {
     var ipc = hyprlandToplevel && hyprlandToplevel.lastIpcObject
     var address = ipc ? ipc.address : undefined
-    if (!address) return
-    Quickshell.execDetached(
-      ["hyprctl", "dispatch", "hl.dsp.focus({ window = 'address:" + address + "' })"])
+    if (!address) { root.close(); return }
+    root.handOff("hl.dsp.focus({ window = 'address:" + address + "' })")
   }
 
-  // Close *first*, then dispatch. This overlay holds the keyboard grab
-  // (WlrKeyboardFocus.Exclusive), and when that surface unmaps Hyprland
-  // restores focus to whatever held it before the overlay opened — undoing a
-  // focus dispatched while the overlay was still up. The old code appeared to
-  // dispatch first, but routed it through `bash -lc`, whose ~280ms of login
-  // shell meant it actually landed well after the unmap; making the spawn fast
-  // removed that accidental delay and with it the focus.
-  function focusToplevel(hyprlandToplevel) {
-    root.close()
-    root.dispatchFocus(hyprlandToplevel)
-  }
-
-  // Switching to the empty row's workspace. Same dispatcher family as
-  // dispatchFocus, and the same close-then-dispatch order for the same
-  // reason: this overlay holds the keyboard grab, and focus dispatched while
-  // it is still mapped is taken straight back when it unmaps. There is no
-  // zoom here — a dive is a dive *into a window*, and the point of this row
-  // is that there is no window on it.
+  // Switching to the empty row's workspace. Same dispatcher family and the
+  // same hand-off as focusToplevel, for the same reasons. There is no zoom
+  // here — a dive is a dive *into a window*, and the point of this row is that
+  // there is no window on it — so the overlay simply holds its last frame
+  // across the switch and fades from there.
   //
   // hl.dsp.focus({ workspace = ... }) rather than hl.dsp.workspace, which in
   // 0.55 is a table of sub-dispatchers (move, toggle_special, ...) and not
   // callable; it is also what Omarchy's own SUPER+1..9 bindings use.
   function activateWorkspace(id) {
     if (root.pendingActivation) return
-    root.close()
-    Quickshell.execDetached(
-      ["hyprctl", "dispatch", "hl.dsp.focus({ workspace = '" + id + "' })"])
+    root.handOff("hl.dsp.focus({ workspace = '" + id + "' })")
   }
 
   PanelWindow {
     id: panel
-    visible: root.opened
+    // `leaving` keeps the surface up through the exit fade and through the
+    // beat handOff holds it for; see close() for why `opened` cannot.
+    visible: root.opened || root.leaving
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omari-overview"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    // Dropped the moment the overview starts leaving, by either route: a
+    // dismissal wants the window underneath live again straight away, and a
+    // hand-off needs the grab gone before its dispatch goes out. See handOff.
+    WlrLayershell.keyboardFocus: root.grabsKeyboard
+      ? WlrKeyboardFocus.Exclusive
+      : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
     // Same workaround as the background layer (Background.qml): a
     // layer-shell surface that toggles visible has been observed to come
     // back showing its last committed frame instead of a fresh one. This
-    // surface is only ever composited while root.opened is true, so keeping
+    // surface is only ever composited while it is visible above, so keeping
     // updates enabled unconditionally costs nothing while closed.
     updatesEnabled: true
 
@@ -681,8 +809,9 @@ Item {
       // thumbnails of that same wallpaper.
       color: Qt.lighter(Color.background, 1.75)
       // Fades out as the view dives into a window, so what the strip is
-      // growing against is the real desktop it is about to become.
-      opacity: 1 - root.zoomProgress
+      // growing against is the real desktop it is about to become — and again,
+      // through exitOpacity, on the way out of a dismissal.
+      opacity: (1 - root.zoomProgress) * root.exitOpacity
     }
 
     MouseArea {
@@ -694,6 +823,10 @@ Item {
       id: keyCatcher
       anchors.fill: parent
       focus: panel.visible
+      // The strip's half of the exit fade; the backdrop above carries the
+      // other half. Both are children of the window rather than of one item,
+      // so the fade is applied to each rather than to the pair.
+      opacity: root.exitOpacity
 
       Keys.onPressed: function(event) {
         switch (event.key) {
@@ -1192,8 +1325,16 @@ Item {
                           Math.round(root.captureBaseHeight * Screen.devicePixelRatio))
 
                         // A row created off-screen has no last frame to
-                        // keep, so grab one still for it up front.
-                        Component.onCompleted: if (!capture.live) capture.captureFrame()
+                        // keep, so grab one still for it up front -- but only
+                        // while the overview is actually up. The plugin is
+                        // keepLoaded, so these delegates also exist, and are
+                        // rebuilt every time a window opens or closes, with
+                        // the overview closed and no recording context to
+                        // capture into: asking then is work that can only
+                        // fail, and it logged a warning per thumbnail for the
+                        // privilege.
+                        Component.onCompleted:
+                          if (root.opened && !capture.live) capture.captureFrame()
                       }
 
                       // No title bar over the bottom of the thumbnail. At this

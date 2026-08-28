@@ -81,6 +81,19 @@ down by its scale before the two are compared. Getting that wrong is not a
 small error — on a 2× monitor it draws the monitor rectangle at the right size
 but every window at half of it.
 
+**That geometry has to be asked for.** Every rectangle here comes from
+Hyprland's own `at`/`size`, read off `HyprlandToplevel.lastIpcObject`, and that
+field is filled in by an IPC query and by nothing else: Quickshell builds a
+toplevel from the `openwindow` event with no geometry at all, and one built by
+the query at startup keeps the geometry it had at that moment however many times
+the scrolling layout has moved it since. With no geometry, `rectFor` returns
+null and the fallback is the monitor rectangle — so a workspace's windows all
+stack on the same spot at the same size, only the topmost visible, and it takes
+every click whichever thumbnail was aimed at. So `Hyprland.refreshToplevels()`
+runs on the way in, and again (coalesced through a 50ms timer) on the Hyprland
+events that move windows. Every rectangle is a binding over `lastIpcObject`, so
+the rows lay themselves out again when the answer arrives.
+
 ## Look
 
 Modelled on niri's overview, and the deliberate choices are mostly things
@@ -129,35 +142,74 @@ Two things here are easy to get wrong and were both got wrong first:
   sits on its floor and a thumbnail measures a fraction of its eventual size —
   which lands in the scale factor as a seven rather than a two and flings the
   strip off screen. A fixed delay is not a fix either, since the compositor
-  decides when the surface gets its size. So it polls, and requires a real size
-  to have held for two consecutive ticks, giving `Column` a polish pass in
-  between to position the rows `mapToItem` is about to be asked about.
+  decides when the surface gets its size. It is measured on the first rendered
+  frame instead; see *Opening cost* below for why that is both early enough and
+  late enough.
 - **`transform: [Scale, Translate]` is not `s*p + t`.** Transform lists
   post-multiply, so that pair maps a child point to `s*(p + t)` — the
   translation comes out scaled too. The layer uses `x`/`y`/`scale` with
   `transformOrigin: Item.TopLeft` instead, which is exactly `s*p + t` with no
   order to get wrong.
 
-Escape and a background click just close, with no animation — there is no
-window being dived into.
+Escape and a background click do not dive — there is no window being dived
+into — but they do not cut away either: the whole overlay fades over 110ms and
+then unmaps. `opened` goes false at the *start* of that fade and the surface is
+held up by a separate `leaving` flag, because `opened` is what the host answers
+"is this plugin open?" with: leaving it true would swallow a swipe arriving
+during the fade, which is exactly where one arrives. As it stands that swipe
+reopens a surface that never unmapped, which is instant.
 
-**Focus must be dispatched after the overlay closes, never before.** This
-surface holds the keyboard grab (`WlrKeyboardFocus.Exclusive`), and when it
-unmaps Hyprland refocuses on its own — undoing any focus dispatched while the
-overlay was still up. The failure is deceptive because that refocus lands on
-the window under the cursor: click a thumbnail whose window really is at that
-spot on the live workspace and you appear to get what you asked for, so only
-windows scrolled off the monitor look broken. Dispatching early to overlap the
-workspace switch with the dive was tried, and is exactly this bug.
+## Opening cost
+
+Opening the overview means mapping a fresh full-screen layer-shell surface, and
+the two frames that takes were measured at **~200ms each**. That cost is in the
+surface, not in what is drawn on it: taking the row shadows out of the scene,
+then the screencopy streams, then the wallpaper, each changed it by nothing.
+Two things follow.
+
+The plugin is `keepLoaded`, so the QML is instantiated once at shell start
+rather than on every summon — worth another ~250ms per open, measured — and the
+rows survive between summons already laid out, which is what lets the zoom be
+measured on the very first frame.
+
+The zoom itself is driven by a `FrameAnimation` rather than a `NumberAnimation`,
+because a wall-clock animation started for that first frame is simply over by
+the time the second one is drawn: the overview snapped into place instead of
+falling back into it. Capping how far one frame may carry the ramp (a sixth)
+turns that into a slower zoom rather than no zoom. On a healthy 60Hz frame the
+cap is nowhere near reached and it is exactly the animation it replaces.
+
+The ramp also starts one capped step in rather than at the very start. At
+progress 1 the strip is a pixel-exact stand-in for the window it covers, so a
+ramp starting there spends that hard-won first frame drawing something
+indistinguishable from the desktop already on screen. A step in, and the first
+thing drawn is the overview visibly pulling back — at ~200-300ms after the
+swipe rather than the ~550ms it used to take to start moving.
+
+**Focus is dispatched with the grab handed back, and the overlay held across
+the switch.** This surface takes the keyboard grab
+(`WlrKeyboardFocus.Exclusive`), and while it holds one, a focus dispatch does
+not stick: when the surface unmaps Hyprland refocuses on its own and undoes it.
+The failure is deceptive because that refocus lands on the window under the
+cursor — click a thumbnail whose window really is at that spot on the live
+workspace and you appear to get what you asked for, so only windows scrolled off
+the monitor look broken.
+
+Closing first avoids that but buys a flicker: the unmap happens before the
+workspace switch lands, so a frame of the workspace you are *leaving* shows
+between the dive ending and the new one arriving. Setting `keyboardFocus` to
+`None` hands the grab back without unmapping, so the dispatch is the last word
+and the surface can stay up across the switch — holding its final zoomed frame,
+which is the destination window at real size in its real place, so what it
+covers is exactly the switch. It unmaps 110ms later.
 
 The dispatch is spawned bare rather than through `Util.execArgv`, which runs
 everything under `bash -lc`. A login shell costs **~280ms** here sourcing
 profile scripts, against ~10ms for `hyprctl` itself; it was most of the lag
 between picking a window and the workspace actually changing. Nothing on that
-command line needs a shell. That delay was also, accidentally, what made the
-old ordering work: the dispatch was written before `close()` but did not land
-until long after the unmap. Removing the delay removed the focus with it —
-hence the explicit ordering above rather than a lucky one.
+command line needs a shell. That delay was also, accidentally, what made an
+earlier dispatch-then-close ordering appear to work: the dispatch was written
+first but did not land until long after the unmap.
 
 ## Navigation
 
