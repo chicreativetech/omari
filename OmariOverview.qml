@@ -54,6 +54,15 @@ Item {
     root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
     root.refreshGeometry()
     bgPathProc.running = true
+    // Whatever the last leave had got as far as, it is cancelled rather than
+    // left to run: close() promises that a swipe arriving during the fade
+    // brings the overview straight back, and a NumberAnimation still ticking
+    // on exitOpacity would have faded it out again from under that promise —
+    // and then called finish() on a surface that had just been reopened.
+    exitFade.stop()
+    switchHold.stop()
+    handOffTimer.stop()
+    root.thawGeometry()
     root.clearZoom()
     // Start fully zoomed in, onto nothing yet: there is no thumbnail to
     // measure until the surface has been laid out, so zoomOpener does the
@@ -63,12 +72,15 @@ Item {
     // zoom-out should start from anyway.
     root.zoomProgress = 1
     root.zoomReady = false
-    root.leaving = false
     root.grabsKeyboard = true
     root.exitOpacity = 1
+    // `opened` goes up before `leaving` comes down, and that order is not
+    // cosmetic -- see panel.visible.
     root.opened = true
+    root.leaving = false
     root.gestureAxis = ""
     vScroll.reset()
+    root.viewReset()
   }
 
   // The user-facing dismissal, and what the host's hide() reaches: fade, then
@@ -89,8 +101,10 @@ Item {
   // underneath is live again the moment you ask to leave.
   function close() {
     if (!root.opened || root.leaving) return
-    root.opened = false
+    root.freezeGeometry()
+    // `leaving` first, then `opened` -- see panel.visible.
     root.leaving = true
+    root.opened = false
     root.grabsKeyboard = false
     exitFade.restart()
   }
@@ -100,6 +114,7 @@ Item {
   // surface, and would still be mid-glide the next time it opens.
   function finish() {
     exitFade.stop()
+    switchHold.stop()
     handOffTimer.stop()
     root.opened = false
     root.leaving = false
@@ -108,11 +123,21 @@ Item {
     root.gestureAxis = ""
     geometryRefresh.stop()
     root.clearZoom()
+    root.thawGeometry()
     vScroll.reset()
+    root.viewReset()
   }
 
   function toggle() { if (root.opened) root.close(); else root.open() }
   function ping() { return "ok" }
+
+  // Broadcast to the row delegates, which cannot be reached by name from out
+  // here. viewReset() puts every row's strip back where a fresh overview
+  // starts; viewFrozen() only stops whatever it is doing, leaving it exactly
+  // where it stands. The difference matters a great deal -- see the row's own
+  // handlers, and freezeGeometry below.
+  signal viewReset()
+  signal viewFrozen()
 
   // ---- leaving ----
   //
@@ -281,6 +306,15 @@ Item {
   // centred, snapped to or selected. `omariEmpty` is what the two places that
   // do care — the click target and Enter — recognise it by.
   readonly property var workspaceRows: {
+    // Held while the overview is leaving. Focusing a window on another
+    // workspace can destroy the empty one being left and create the one being
+    // arrived at, and Hyprland says so on the event socket: the workspace
+    // model changes, this list is rebuilt, and the Repeater over it throws
+    // away every row and every screencopy stream in it -- in the middle of the
+    // dive that is drawn from them. Nothing that happens after the click can
+    // change what the overview is a picture of, so nothing after the click is
+    // allowed to.
+    if (root.frozenRows) return root.frozenRows
     var rows = root.windowedRows.slice()
     rows.push({
       id: root.emptyWorkspaceId,
@@ -407,6 +441,50 @@ Item {
   property bool zoomReady: true
   property var pendingActivation: null
 
+  // Which thumbnail the in-flight dive is aimed at. Kept so aimZoom can find
+  // it again once Hyprland has answered, without the click having to be
+  // replayed.
+  property int diveRow: -1
+  property int diveApp: -1
+
+  // How far the dive's own row has to scroll, in row pixels, to end up showing
+  // what its workspace is about to show. See aimZoom -- this is the miniature
+  // of the scroll Hyprland is performing at full size behind the overlay, and
+  // the row performs it on the same progress the zoom runs on.
+  property real diveShiftPx: 0
+
+  // Between the focus dispatch going out and the layout it produced coming
+  // back. See activateToplevel.
+  property bool awaitingLanding: false
+
+  // Long enough to cover what runs behind it. Two things do: the workspace
+  // slide, which omari-mode.lua sets to speed 3 — deciseconds, so 300ms — and
+  // the scrolling layout pulling the focused column into view, which is
+  // windowsMove, 600ms on Omarchy's defaults. The slide is matched exactly.
+  // The column scroll is not, and does not need to be: it is an easeOutQuint,
+  // so 300ms in it has already covered 97% of its distance and the rest of it
+  // is a few pixels of creep, which is what the beat after the dive is for.
+  readonly property int diveMs: 300
+
+  // Frame and phase tracing for the open/dive transitions, off by default.
+  // Turning it on prints the timings that found the unmap described at
+  // panel.visible: how long each phase of the click took, when Hyprland's
+  // reply actually arrived, and every frame interval of both ramps. Worth
+  // keeping -- the failure it diagnosed was invisible from the outside and
+  // looked exactly like "the zoom is too expensive".
+  property bool omariDebug: false
+  property real dbgClickMs: 0
+  function dbg(msg) { if (root.omariDebug) console.warn("OMARI " + msg) }
+  function dbgCounts() {
+    var rows = root.workspaceRows.length
+    var wins = 0
+    for (var i = 0; i < rows; i++) {
+      var r = root.workspaceRows[i]
+      if (r && r.toplevels) wins += r.toplevels.values.length
+    }
+    return "rows=" + rows + " windows=" + wins
+  }
+
   readonly property real zoomFactor: 1 + root.zoomProgress * (root.zoomScale - 1)
 
   // Ramping the scale alone would drag the target away from both endpoints in
@@ -440,7 +518,16 @@ Item {
 
   function clearZoom() {
     zoomRamp.halt()
+    diveDeadline.stop()
+    aimRetry.stop()
+    root.aimRetries = 0
+    root.pendingDispatch = ""
+    restoreFallback.stop()
     root.pendingActivation = null
+    root.diveRow = -1
+    root.diveApp = -1
+    root.diveShiftPx = 0
+    root.awaitingLanding = false
     root.zoomProgress = 0
     root.zoomScale = 1
     root.zoomThumbX = 0
@@ -450,23 +537,291 @@ Item {
     root.zoomReady = true
   }
 
-  // The dive runs first and the focus goes out at the end of it — see
-  // focusToplevel for what that order buys and what it costs.
+  // Clicking a window is a dive *and* a workspace switch, and the whole trick
+  // is making them the same event rather than one after the other.
+  //
+  // The dispatch goes out first, before a pixel of the dive has been drawn.
+  // Hyprland answers it with a workspace slide, and — because this is a
+  // scrolling layout — with a scroll that brings the focused column into view,
+  // and those two animations are precisely what the overview is here to hide.
+  // Dispatching at the end of the dive instead ran them *after* the overlay
+  // had gone: the strip was cut away and the desktop then visibly assembled
+  // itself, sliding and scrolling into place in full view. Dispatching first
+  // puts all of it behind the backdrop, and the dive is timed to end as it
+  // does.
+  //
+  // Where the dive is aimed has to wait on the same dispatch, since it is the
+  // dispatch that decides where the window ends up — so the ramp does not
+  // start until Hyprland has answered with the layout it produced (see
+  // diveDispatch and aimZoom). That answer costs a couple of frames, and the
+  // overview spends them standing perfectly still under an opaque backdrop,
+  // which is the least visible moment in the whole transition to spend them
+  // in.
+  //
+  // Standing *still* is not free either: the click freezes the overview
+  // outright — see freezeGeometry — because everything the dispatch sets off
+  // arrives back through Quickshell's models as well, and a row that
+  // re-lays itself out, or a Repeater that rebuilds its delegates, does so
+  // inside a layer on its way to twice size and with the screencopy streams
+  // that the dive is drawn from inside it.
   function activateToplevel(toplevel, rowIndex, appIndex) {
     if (!toplevel) return
     if (root.pendingActivation || root.leaving) return
-    if (!root.captureZoom(rowIndex, appIndex)) {
+    root.dbgClickMs = Date.now()
+    var arg = root.focusArg(toplevel)
+    var tArg = Date.now()
+    root.freezeGeometry()
+    var tFreeze = Date.now()
+    var captured = root.captureZoom(rowIndex, appIndex)
+    var tCapture = Date.now()
+    root.dbg("phases focusArg=" + (tArg - root.dbgClickMs) + "ms freeze="
+      + (tFreeze - tArg) + "ms capture=" + (tCapture - tFreeze) + "ms")
+    if (!arg || !captured) {
       root.focusToplevel(toplevel)
       return
     }
+    root.dbg("click " + root.dbgCounts()
+      + " thumb=(" + Math.round(root.zoomThumbX) + "," + Math.round(root.zoomThumbY) + ")"
+      + " capturedReal=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY) + ")"
+      + " scale=" + root.zoomScale.toFixed(3))
     root.pendingActivation = toplevel
-    zoomRamp.run(0, 1, 200, root.finishActivation)
+    root.aimRetries = 0
+    root.diveRow = rowIndex
+    root.diveApp = appIndex
+    root.awaitingLanding = true
+    root.beginHandOff(arg)
+    diveDeadline.restart()
   }
 
-  function finishActivation() {
-    var toplevel = root.pendingActivation
-    root.pendingActivation = null
-    root.focusToplevel(toplevel)
+  // The dispatch and the aim in one request. `hyprctl --batch` runs its
+  // commands in order inside Hyprland, and `at` is a goal rather than an
+  // animated value, so the window that comes back with the reply is already
+  // described as it will be when the compositor has finished moving it: the
+  // focused column pulled into view, and — since a scrolling layout brings a
+  // column into view by translating all of them — every one of its neighbours
+  // carried the same distance, which is why one measurement lands the whole
+  // frozen row and not just the window that was clicked.
+  //
+  // Measured at ~7ms end to end with the process spawn included, against ~30ms
+  // and two things to get right for the alternative of dispatching blind and
+  // then waiting on the event socket to hear that it had landed.
+  //
+  // Not Util.execArgv, for the reason beginHandOff gives: a login shell costs
+  // ~280ms here and nothing on this command line needs one.
+
+  property string hyprRequest: ""
+  property string hyprReply: ""
+  property bool hyprPending: false
+
+  Socket {
+    id: hyprIpc
+    path: Hyprland.requestSocketPath
+    // Hyprland answers and then closes, and Quickshell reports that close as
+    // an error rather than as the end of a stream -- so StdioCollector, which
+    // only hands its text over on a clean end, never hands it over at all.
+    // The chunks are collected as they arrive instead, and the disconnect is
+    // what says the answer is complete.
+    parser: SplitParser {
+      splitMarker: ""
+      onRead: function(data) {
+        root.dbg("socket chunk " + data.length + " bytes at "
+          + (Date.now() - root.dbgClickMs) + "ms")
+        root.hyprReply += data
+      }
+    }
+    onConnectionStateChanged: {
+      if (hyprIpc.connected) {
+        root.hyprReply = ""
+        hyprIpc.write(root.hyprRequest)
+        hyprIpc.flush()
+        root.dbg("socket connected+written at " + (Date.now() - root.dbgClickMs) + "ms")
+        return
+      }
+      if (!root.hyprPending) return
+      root.hyprPending = false
+      root.dbg("socket reply at " + (Date.now() - root.dbgClickMs) + "ms, "
+        + root.hyprReply.length + " bytes")
+      root.beginDive(root.hyprReply)
+    }
+    onError: function(err) { root.dbg("socket error " + err) }
+  }
+
+  function hyprSend(request) {
+    root.dbg("hyprSend at " + (Date.now() - root.dbgClickMs) + "ms REQ="
+      + JSON.stringify(request))
+    root.hyprRequest = request
+    root.hyprPending = true
+    if (hyprIpc.connected) hyprIpc.connected = false
+    hyprIpc.connected = true
+  }
+
+  // The dispatch and the aim in one request, once pendingDispatch says the
+  // moment is right. `hyprctl --batch` runs its commands in order inside
+  // Hyprland, and `at` is a goal rather than an animated value, so the window
+  // that comes back with the reply is already described as it will be when the
+  // compositor has finished moving it: the focused column pulled into view,
+  // and -- since a scrolling layout brings a column into view by translating
+  // all of them -- every one of its neighbours carried the same distance,
+  // which is why one measurement lands the whole frozen row and not just the
+  // window that was clicked.
+  //
+  // Sent down Hyprland's own request socket rather than spawned as a `hyprctl`
+  // process: sub-millisecond against ~10ms, and the reply is the whole point.
+  // It was briefly suspected of not working at all -- Hyprland answering "ok"
+  // and moving nothing -- but that was the focus restore described at
+  // pendingDispatch overwriting a dispatch that had in fact landed. Sent after
+  // the restore instead, it lands and stays, and the aim comes back with it.
+  function dispatchAndAim(arg) {
+    root.hyprSend("[[BATCH]]dispatch " + arg + ";j/activewindow")
+  }
+
+  // Whether an answer describes some window other than the one that was
+  // clicked, which is Hyprland saying "not yet" rather than "not that one".
+  //
+  // The dispatch reliably lands -- the workspace does switch and the right
+  // window does end up focused -- but the answer to the `j/activewindow` in
+  // the same batch can still be the window that had focus *before* the click.
+  // The overlay gives its keyboard grab back one statement before the dispatch
+  // goes out (see beginHandOff), and giving it back is a Wayland commit that
+  // Hyprland has not necessarily processed by the time it reads the batch. Run
+  // the identical batch with no overview up and it matches every time in half
+  // a millisecond; run it from here and it can describe the old focus.
+  //
+  // This was always true and was never visible, because the reply used to be
+  // read ~700ms late (see panel.visible) -- by which point Hyprland had long
+  // since settled and the answer was right for the wrong reason. Fixing the
+  // stall is what surfaced it: the aim was silently falling back to the
+  // pre-scroll capture, which is precisely the "dived at a place the window
+  // was about to stop being" failure aimZoom was written to end.
+  function aimIsStale(win) {
+    if (!win || !win.address) return false
+    var ipc = root.pendingActivation ? root.pendingActivation.lastIpcObject : undefined
+    if (!ipc || !ipc.address) return false
+    return String(win.address) !== String(ipc.address)
+  }
+
+  property int aimRetries: 0
+
+  // Just a query this time: the dispatch has already gone out and must not be
+  // sent twice, and what is still wanted is the layout it produced.
+  Timer {
+    id: aimRetry
+    interval: 8
+    onTriggered: root.hyprSend("j/activewindow")
+  }
+
+  // Hyprland has answered with the layout the dispatch produced: aim, and go.
+  function beginDive(reply) {
+    if (!root.awaitingLanding) return
+    var win = root.parseWindow(reply)
+    root.dbg("reply after " + Math.round(Date.now() - root.dbgClickMs) + "ms"
+      + " retries=" + root.aimRetries
+      + " deadline=" + (diveDeadline.running ? "no" : "YES-FIRED")
+      + " parsed=" + (win ? "yes" : "NO")
+      + " raw=" + JSON.stringify((reply || "").slice(0, 60)))
+    // Ask again rather than aim at an answer known to be about the wrong
+    // window. Bounded by diveDeadline alone, which is the one thing that must
+    // decide when the overview stops waiting: a retry budget of its own would
+    // be a second deadline to keep in step with the first.
+    if (root.aimIsStale(win) && diveDeadline.running) {
+      root.aimRetries++
+      aimRetry.restart()
+      return
+    }
+    root.awaitingLanding = false
+    diveDeadline.stop()
+    aimRetry.stop()
+    root.aimZoom(win)
+    root.dbg("aimed shift=" + root.diveShiftPx.toFixed(1)
+      + " real=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY) + ")"
+      + " scale=" + root.zoomScale.toFixed(3))
+    zoomRamp.run(0, 1, root.diveMs, root.finishActivation)
+  }
+
+  // The reply carries the dispatcher's own "ok" ahead of the JSON.
+  function parseWindow(reply) {
+    var text = reply || ""
+    var start = text.indexOf("{")
+    if (start < 0) return null
+    try { return JSON.parse(text.slice(start)) } catch (e) { return null }
+  }
+
+  // The far end of the dive: where the window will actually be, rather than
+  // where it was when it was clicked. Aiming at the latter is what used to
+  // send the dive somewhere the window was about to stop being — a column
+  // waiting off the right-hand edge of its workspace was dived into at its
+  // off-screen place, so the strip flew off the screen, the overlay vanished,
+  // and the window was found most of a screen's width to the left, having
+  // scrolled there in full view.
+  //
+  // Leaves the aim as captured if anything about the reply is unexpected: a
+  // dive to where the window was is still better than no dive at all.
+  function aimZoom(win) {
+    if (!win || !win.address) return
+    var ipc = root.pendingActivation ? root.pendingActivation.lastIpcObject : undefined
+    // Whatever Hyprland ended up focusing is not what was clicked; measuring
+    // it would aim the dive at a different window entirely.
+    if (!ipc || String(win.address) !== String(ipc.address)) return
+    var row = rowRepeater.itemAt(root.diveRow)
+    if (!row) return
+    var item = row.thumbItemAt(root.diveApp)
+    if (!item || item.width <= 0) return
+    var r = root.rectFromIpc(win)
+    if (!r) return
+
+    // The row scrolls too, and it has to.
+    //
+    // A row is a workspace drawn twice over: a wallpaper fixed under the
+    // middle of it, standing for the monitor, and a strip of windows that
+    // slides across that wallpaper exactly as a scrolling layout slides its
+    // columns across a screen that does not move. Landing the dive is
+    // therefore two claims at once, not one -- this window on that window,
+    // *and* this wallpaper on that monitor -- and the zoom is a single rigid
+    // transform, so it can only satisfy both if the window already sits at the
+    // right offset from the wallpaper before the transform is applied.
+    //
+    // It does not. The whole reason the dive is aimed at Hyprland's answer is
+    // that focusing a window scrolls its workspace, and the row is still drawn
+    // from the layout as it was before that scroll. Aiming at the new place
+    // and leaving the row alone satisfies the first claim by breaking the
+    // second: the transform slides the entire row, wallpaper included, by the
+    // distance the layout is about to travel -- 790px of a 1600px screen in
+    // the case that prompted this -- so the dive ended on the right window
+    // over half a screen of wallpaper that did not belong there, complete with
+    // the shadow along its edge, and all of it vanished at the unmap.
+    //
+    // So the row performs the same scroll, in miniature, on the same progress
+    // the zoom runs on: by the time the transform is at full size the window
+    // has moved to its new offset from the wallpaper, and both claims hold.
+    var pre = root.rectFor(root.pendingActivation)
+    root.diveShiftPx = pre ? (pre.x - r.x) * row.geomScale : 0
+    // Where that leaves the thumbnail when the ramp is done, which is what the
+    // zoom has to be aimed from -- see zoomOffset. At progress 0 the shift is
+    // zero and the strip is untouched, so nothing moves under the capture.
+    root.zoomThumbX -= root.diveShiftPx
+
+    root.zoomRealX = r.x - row.monX
+    root.zoomRealY = r.y - row.monY
+    root.zoomScale = r.w / item.width
+  }
+
+  // The dispatch went out a whole dive ago and the desktop behind has already
+  // stopped moving, so all that is left is to stop holding the frame over it.
+  function finishActivation() { handOffTimer.restart() }
+
+  // The backstop, for a reply that never comes: an overview that has already
+  // handed the keyboard back and dispatched its focus cannot be left sitting
+  // on the screen waiting for one. Long enough that the round trip normally
+  // beats it several times over.
+  // Covers the restore wait (see pendingDispatch, ~40-90ms) as well as the
+  // round trip that follows it (~12ms), with room to spare.
+  Timer {
+    id: diveDeadline
+    interval: 200
+    onTriggered: {
+      root.dbg("DEADLINE fired at " + (Date.now() - root.dbgClickMs) + "ms")
+      root.beginDive("")
+    }
   }
 
   // Measures the zoom and starts the fall-back on the first frame the
@@ -540,7 +895,16 @@ Item {
 
     // `head` starts the ramp already that far along, for a ramp whose first
     // frame is also the first frame anyone can see.
+    property var dbgTimes: []
+    property int dbgFrames: 0
+    property real dbgMaxFrame: 0
+    property real dbgStart: 0
+
     function run(a, b, ms, done, head) {
+      zoomRamp.dbgFrames = 0
+      zoomRamp.dbgTimes = []
+      zoomRamp.dbgMaxFrame = 0
+      zoomRamp.dbgStart = Date.now()
       zoomRamp.fromValue = a
       zoomRamp.toValue = b
       zoomRamp.durationMs = Math.max(1, ms)
@@ -557,16 +921,30 @@ Item {
       zoomRamp.stop()
     }
 
-    // OutCubic falling back into the overview, InCubic diving into a window --
-    // the pair the two NumberAnimations carried, written out because a
-    // FrameAnimation has no easing curve of its own.
+    // OutCubic falling back into the overview, InOutCubic diving into a
+    // window, written out because a FrameAnimation has no easing curve of its
+    // own.
+    //
+    // The dive was an InCubic, and a cubic ease-*in* puts almost all of its
+    // travel in the last third of the ramp. Now that the dive crosses whatever
+    // distance the layout is about to scroll (see aimZoom) rather than a
+    // thumbnail's width, that meant three or four frames carrying a couple of
+    // hundred pixels each -- the choppiest possible way to arrive, at the one
+    // moment that has to be invisible, since arriving is where the strip and
+    // the real window have to become the same picture. Easing out into the
+    // landing spends those frames a pixel or two at a time instead.
     function eased(x) {
-      return zoomRamp.toValue < zoomRamp.fromValue
-        ? 1 - Math.pow(1 - x, 3)
-        : x * x * x
+      if (zoomRamp.toValue < zoomRamp.fromValue) return 1 - Math.pow(1 - x, 3)
+      return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2
     }
 
     onTriggered: {
+      if (root.omariDebug) {
+        zoomRamp.dbgFrames++
+        if (zoomRamp.frameTime * 1000 > zoomRamp.dbgMaxFrame)
+          zoomRamp.dbgMaxFrame = zoomRamp.frameTime * 1000
+        zoomRamp.dbgTimes.push(Math.round(zoomRamp.frameTime * 1000))
+      }
       // frameTime is seconds since the previous frame.
       var step = Math.min(zoomRamp.frameTime * 1000 / zoomRamp.durationMs,
                           zoomRamp.maxStep)
@@ -574,6 +952,13 @@ Item {
       root.zoomProgress = zoomRamp.fromValue
         + (zoomRamp.toValue - zoomRamp.fromValue) * zoomRamp.eased(zoomRamp.t)
       if (zoomRamp.t < 1) return
+      root.dbg((zoomRamp.toValue > zoomRamp.fromValue ? "dive" : "open")
+        + " ramp done: " + zoomRamp.dbgFrames + " frames over "
+        + Math.round(Date.now() - zoomRamp.dbgStart) + "ms"
+        + " (asked " + Math.round(zoomRamp.durationMs) + "ms)"
+        + " worst frame " + zoomRamp.dbgMaxFrame.toFixed(1) + "ms"
+        + " avg " + ((Date.now() - zoomRamp.dbgStart) / Math.max(1, zoomRamp.dbgFrames)).toFixed(1) + "ms"
+        + " frames=[" + zoomRamp.dbgTimes.join(",") + "]")
       zoomRamp.stop()
       var done = zoomRamp.whenDone
       zoomRamp.whenDone = null
@@ -631,8 +1016,20 @@ Item {
   // focused window; on every other workspace this is whichever window would
   // regain focus if you switched there). Falls back to the first window if
   // the field is ever missing.
+  // Frozen along with the rectangles, and for a sharper reason than they are.
+  // A focus dispatch renumbers focusHistoryID across *every* workspace, not
+  // just the one being switched to, so a live read here moved the ring on rows
+  // the click never touched -- and the ring is not decoration: it feeds
+  // rowItem.selectedIndex, which feeds restX, which is a KineticScroll rest
+  // position, so each of those rows glided its strip somewhere new in the
+  // middle of the dive.
   function focusHistoryIdFor(toplevel) {
-    var raw = toplevel && toplevel.lastIpcObject ? toplevel.lastIpcObject.focusHistoryID : undefined
+    var ipc = toplevel ? toplevel.lastIpcObject : undefined
+    if (root.frozenFocus && ipc && ipc.address) {
+      var frozen = root.frozenFocus[ipc.address]
+      if (frozen !== undefined) return frozen
+    }
+    var raw = ipc ? ipc.focusHistoryID : undefined
     var n = Number(raw)
     return isFinite(n) ? n : Number.MAX_SAFE_INTEGER
   }
@@ -651,16 +1048,35 @@ Item {
   // corner, in layout/monitor coordinates), so thumbnails can be ordered the
   // same way the actual windows are arranged on the workspace rather than
   // whatever order Hyprland's toplevels list happens to hold.
+  //
+  // Through rectFor rather than off lastIpcObject directly, so the sort is
+  // frozen with everything else. It was the one measurement the freeze did not
+  // reach, and being a *sort* it was the most visible thing that could still
+  // move: the instant the dispatch landed, Hyprland's goal `at` for the
+  // destination workspace's windows was already the post-scroll layout, the
+  // row re-sorted, and its thumbnails swapped places outright -- a jump, not a
+  // slide, inside a layer on its way to twice size.
   function spatialXFor(toplevel) {
-    var at = toplevel && toplevel.lastIpcObject ? toplevel.lastIpcObject.at : undefined
-    var n = at && at.length > 0 ? Number(at[0]) : NaN
-    return isFinite(n) ? n : Number.MAX_SAFE_INTEGER
+    var r = root.rectFor(toplevel)
+    return r ? r.x : Number.MAX_SAFE_INTEGER
   }
 
   function sortToplevelsBySpatialOrder(values) {
     var arr = values ? values.slice() : []
     arr.sort(function(a, b) { return root.spatialXFor(a) - root.spatialXFor(b) })
     return arr
+  }
+
+  // What everything the overview *draws* asks. Answers with the frozen
+  // rectangle once the overview is leaving, and with Hyprland's live one until
+  // then; see frozenRects below for why the two have to be different.
+  function rectFor(toplevel) {
+    if (root.frozenRects) {
+      var ipc = toplevel ? toplevel.lastIpcObject : undefined
+      var frozen = (ipc && ipc.address) ? root.frozenRects[ipc.address] : undefined
+      if (frozen) return frozen
+    }
+    return root.liveRectFor(toplevel)
   }
 
   // A window's real rectangle in Hyprland's layout coordinates, or null when
@@ -672,8 +1088,14 @@ Item {
   // Note these are *logical* pixels, while HyprlandMonitor reports its size in
   // physical ones — see geomScale in the row delegate, which divides the
   // monitor back down before the two are compared.
-  function rectFor(toplevel) {
-    var ipc = toplevel ? toplevel.lastIpcObject : undefined
+  function liveRectFor(toplevel) {
+    return root.rectFromIpc(toplevel ? toplevel.lastIpcObject : undefined)
+  }
+
+  // The same measurement off a bare window object, for the one that comes back
+  // from Hyprland by hand rather than through Quickshell's model; see
+  // diveDispatch.
+  function rectFromIpc(ipc) {
     var at = ipc ? ipc.at : undefined
     var size = ipc ? ipc.size : undefined
     if (!at || !size || at.length < 2 || size.length < 2) return null
@@ -682,6 +1104,96 @@ Item {
     if (!isFinite(x) || !isFinite(y) || !isFinite(w) || !isFinite(h)) return null
     if (w <= 0 || h <= 0) return null
     return { x: x, y: y, w: w, h: h }
+  }
+
+  // ---- frozen geometry ----
+  //
+  // Activating a window moves the very layout the overview is a picture of.
+  // Hyprland reports a window's *goal* rectangle rather than its animated one,
+  // so the instant the focus dispatch lands, `at` for every window on the
+  // destination workspace is already the place the scrolling layout is about
+  // to slide it to. That is exactly what the dive needs to aim at (aimZoom),
+  // and exactly what the rows underneath the dive must not follow: a row that
+  // re-lays itself out mid-dive drags the thumbnail being dived into sideways
+  // inside a layer scaled by 2x or more, and every window in the row with it.
+  //
+  // So the rows are pinned to the rectangles they had at the moment of the
+  // click, and the fresh geometry is read straight from IPC by the dive alone.
+  // Pinning them is also what makes the landing exact for the whole row rather
+  // than for one window: a scrolling layout brings a column into view by
+  // translating every column by the same amount, so a frozen row is a rigid
+  // replica, and putting the target on its real place puts every one of its
+  // neighbours on theirs too.
+  property var frozenRects: null
+  property var frozenRows: null
+  property var frozenFocus: null
+
+  // Whether the picture is pinned. The scrollers bind their own `frozen` to
+  // this rather than being told once, so nothing that arrives later can start
+  // them moving again -- see KineticScroll.
+  readonly property bool viewIsFrozen: root.frozenRects !== null
+
+  // A row list that answers the three questions the delegates ask -- `id`,
+  // `monitor`, `toplevels.values` -- out of plain snapshots rather than out of
+  // live Hyprland objects.
+  //
+  // Holding root.workspaceRows itself was not enough. The *list* stopped being
+  // rebuilt, but the entries in it were the real HyprlandWorkspace objects,
+  // and `toplevels.values` on one of those is as live as anything else here:
+  // the focus dispatch moves the active workspace, Quickshell rebuilds that
+  // model, and a row silently gained or lost a window mid-dive -- which
+  // re-runs the Repeater over it and re-lays out every thumbnail beside it.
+  function snapshotRows(rows) {
+    var out = []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      var vals = (row && row.toplevels) ? row.toplevels.values : []
+      out.push({
+        id: row.id,
+        omariEmpty: !!row.omariEmpty,
+        monitor: row.monitor,
+        toplevels: { values: vals.slice() }
+      })
+    }
+    return out
+  }
+
+  function freezeGeometry() {
+    if (root.frozenRects) return
+    geometryRefresh.stop()
+    var frozen = ({})
+    var focus = ({})
+    var rows = root.windowedRows
+    for (var i = 0; i < rows.length; i++) {
+      var vals = rows[i].toplevels.values
+      for (var j = 0; j < vals.length; j++) {
+        var ipc = vals[j] ? vals[j].lastIpcObject : undefined
+        if (!ipc || !ipc.address) continue
+        var r = root.liveRectFor(vals[j])
+        if (r) frozen[ipc.address] = r
+        var h = Number(ipc.focusHistoryID)
+        if (isFinite(h)) focus[ipc.address] = h
+      }
+    }
+    // All three are handed the value the live binding is answering with right
+    // now, so raising the flags changes nothing that is on screen: the freeze
+    // is invisible going in, and only shows up as the things that stop
+    // happening after it. Rows last, since snapshotRows sorts through
+    // rectFor and wants the rectangles already pinned when it does.
+    root.frozenFocus = focus
+    root.frozenRects = frozen
+    root.frozenRows = root.snapshotRows(root.workspaceRows)
+    // The rectangles are only half of it: a strip still coasting from a flick,
+    // or gliding towards a rest position, moves under the zoom just as surely
+    // as a re-layout would.
+    vScroll.stop()
+    root.viewFrozen()
+  }
+
+  function thawGeometry() {
+    root.frozenRects = null
+    root.frozenRows = null
+    root.frozenFocus = null
   }
 
   // Dispatches through Hyprland itself (hl.dsp.focus({ window = ... })),
@@ -710,8 +1222,8 @@ Item {
   // beyond /usr/bin, which the shell process already has.
   //
   // The order around that dispatch is the delicate part: hand the keyboard
-  // grab back, dispatch, and only *then* unmap, a beat later. It matters in
-  // both directions and this is the only order that satisfies both.
+  // grab back, dispatch, and only *then* unmap, a good deal later. It matters
+  // in both directions and this is the only order that satisfies both.
   //
   // Dispatching while the grab is still held does not stick: Hyprland restores
   // focus to whatever held it before the overlay opened when this surface
@@ -719,45 +1231,130 @@ Item {
   // closing first means the unmap happens before the workspace switch has
   // landed, and what is behind the overlay at that moment is still the
   // workspace being left — so there was a flash of the old desktop between the
-  // dive ending and the new workspace arriving.
+  // overview going away and the new workspace arriving.
   //
   // Setting keyboardFocus to None gives the grab back on its own, without
   // unmapping. Hyprland has already returned focus by the time the dispatch
   // goes out, so the dispatch is the last word, and the surface can stay up
-  // across the switch. It is holding its final zoomed frame while it does —
-  // the destination window at real size in its real place — so what it covers
-  // is exactly the switch.
-  function handOff(dispatchArg) {
-    if (root.leaving) return
-    root.opened = false
+  // across the switch — which is what the whole transition now rests on. The
+  // switch and everything Hyprland animates as part of it happen *underneath*
+  // an overlay that is still there, and what it is showing while they do is
+  // either the overview itself, held still, or a dive that ends on the
+  // destination window at real size in its real place.
+  //
+  // This end of it says nothing about how the overlay then leaves: a dive
+  // holds its own last frame (activateToplevel), everything else fades
+  // (handOff).
+  function beginHandOff(dispatchArg) {
+    root.freezeGeometry()
+    // `leaving` first, then `opened` -- see panel.visible.
     root.leaving = true
+    root.opened = false
+    // Give the grab back, and then wait to be dispatched *after* what that
+    // sets off, rather than in front of it. See pendingDispatch.
     root.grabsKeyboard = false
-    Quickshell.execDetached(["hyprctl", "dispatch", dispatchArg])
-    // A completed dive needs no fade: at full zoom the strip *is* the
-    // destination window at its real size and place, so the overlay is already
-    // indistinguishable from what it is about to become and holding it is the
-    // whole trick. Anything else — the empty row, or a window whose thumbnail
-    // could not be measured to dive into — is still showing the overview, and
-    // that has to go somewhere rather than be cut away.
-    if (root.zoomProgress < 0.999) exitFade.restart()
-    handOffTimer.restart()
+    root.pendingDispatch = dispatchArg
+    restoreFallback.restart()
   }
 
-  // Long enough for `hyprctl dispatch` to spawn, talk to Hyprland and the
-  // switch to be composited — hyprctl itself is ~10ms, and the surface is
-  // invisible against the destination for the whole wait, so erring long
-  // costs nothing while erring short brings the flash back.
+  // The dispatch, held until Hyprland has finished taking focus back.
+  //
+  // Handing the keyboard grab back is not a quiet operation. Hyprland responds
+  // to this surface stopping its exclusive grab by restoring focus to whatever
+  // held it before the overview opened -- and that restore lands about 40ms
+  // after the release, which is comfortably after any dispatch sent in the
+  // same breath as it. So the dispatch was not being ignored, it was being
+  // *overwritten*: sampling the compositor every 40ms across a click shows the
+  // workspace switch land at 41ms and revert at 81ms, every time. What looked
+  // from in here like "Hyprland answers ok and does nothing" was Hyprland
+  // doing it and then undoing it.
+  //
+  // This is the same hazard beginHandOff has always described -- it is why the
+  // grab is given back before dispatching at all -- but "before" was two
+  // statements, and the restore takes rather longer than two statements. The
+  // ~650ms of blocked event loop at panel.visible used to sit between them and
+  // paper over it; nothing does now, so the wait is made explicit.
+  //
+  // Waited out by event and not by clock: the restore *is* an activewindow
+  // change, so Hyprland says when it has happened. The timer is only a
+  // backstop for the case where the restore is a no-op and no event comes --
+  // dismissing onto the window you were already on, say.
+  property string pendingDispatch: ""
+
+  Connections {
+    target: Hyprland
+    enabled: root.pendingDispatch !== ""
+    function onRawEvent(event) {
+      if (event.name === "activewindow" || event.name === "activewindowv2"
+        || event.name === "workspace" || event.name === "workspacev2") {
+        root.runPendingDispatch()
+      }
+    }
+  }
+
+  Timer {
+    id: restoreFallback
+    interval: 90
+    onTriggered: root.runPendingDispatch()
+  }
+
+  function runPendingDispatch() {
+    if (root.pendingDispatch === "") return
+    var arg = root.pendingDispatch
+    root.pendingDispatch = ""
+    restoreFallback.stop()
+    root.dbg("dispatch after restore at " + (Date.now() - root.dbgClickMs) + "ms")
+    // A dive needs the reply as much as it needs the dispatch, so it takes the
+    // longer way round; everything else fires and forgets. The un-dived
+    // hand-off starts holding still for the switch from here too, since here
+    // is where the switch actually begins.
+    if (root.awaitingLanding) root.dispatchAndAim(arg)
+    else { root.hyprSend("dispatch " + arg); switchHold.restart() }
+  }
+
+  // A hand-off with no dive behind it: the empty row, or a window whose
+  // thumbnail could not be measured. There is no zoomed frame to hold, so the
+  // overview simply stays put — opaque, exactly as it was — while the switch
+  // happens behind it, and only then fades off the settled desktop. Cutting
+  // straight to the fade instead uncovered the switch halfway through it.
+  function handOff(dispatchArg) {
+    if (root.leaving) return
+    root.beginHandOff(dispatchArg)
+  }
+
+  // How long the un-dived overview holds still over the switch. A workspace
+  // slide is 300ms (see diveMs) and this is deliberately shorter: the fade
+  // that follows covers the tail of it, and an overview that sits there for a
+  // third of a second having plainly stopped responding reads as a hang.
+  Timer {
+    id: switchHold
+    interval: 190
+    onTriggered: exitFade.restart()
+  }
+
+  // The tail of a dive: the overlay holding its last frame — the destination
+  // window, at real size, in the place Hyprland is putting it — over the real
+  // thing while the last of windowsMove's easeOutQuint runs out underneath.
+  // See diveMs. Cheap to hold and cheap to err long on, since what is being
+  // held is a picture of what it covers.
   Timer {
     id: handOffTimer
-    interval: 110
+    interval: 100
     onTriggered: root.finish()
   }
 
-  function focusToplevel(hyprlandToplevel) {
+  // The dispatcher argument that focuses a window, or "" when the toplevel has
+  // no address to focus by.
+  function focusArg(hyprlandToplevel) {
     var ipc = hyprlandToplevel && hyprlandToplevel.lastIpcObject
     var address = ipc ? ipc.address : undefined
-    if (!address) { root.close(); return }
-    root.handOff("hl.dsp.focus({ window = 'address:" + address + "' })")
+    return address ? "hl.dsp.focus({ window = 'address:" + address + "' })" : ""
+  }
+
+  function focusToplevel(hyprlandToplevel) {
+    var arg = root.focusArg(hyprlandToplevel)
+    if (!arg) { root.close(); return }
+    root.handOff(arg)
   }
 
   // Switching to the empty row's workspace. Same dispatcher family and the
@@ -778,6 +1375,22 @@ Item {
     id: panel
     // `leaving` keeps the surface up through the exit fade and through the
     // beat handOff holds it for; see close() for why `opened` cannot.
+    //
+    // Every writer of that pair must raise the new flag before it drops the
+    // old one, and this is the whole reason why. QML evaluates a binding
+    // synchronously the instant a dependency is assigned, so `opened = false`
+    // followed by `leaving = true` is not one transition but two: for the
+    // width of those two statements this reads false, and Qt takes it at its
+    // word. A layer-shell surface set invisible is unmapped there and then,
+    // and bringing it back is a fresh surface with a fresh configure -- a
+    // blocking round trip to a compositor that, at exactly that moment, is
+    // busy animating the workspace switch the click just dispatched. It cost
+    // ~650ms of dead event loop on every click: the dive's own 120ms deadline
+    // timer fired at 799ms, the Hyprland reply the dive is aimed from sat
+    // unread in the socket for 700ms (0.2ms to answer when it is actually
+    // read), and every ScreencopyView in here was torn down and rebuilt for
+    // the privilege. That was the stutter, and the jump was the desktop
+    // showing through the gap.
     visible: root.opened || root.leaving
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
@@ -811,7 +1424,14 @@ Item {
       // Fades out as the view dives into a window, so what the strip is
       // growing against is the real desktop it is about to become — and again,
       // through exitOpacity, on the way out of a dismissal.
-      opacity: (1 - root.zoomProgress) * root.exitOpacity
+      //
+      // Squared, so it is still nearly opaque through the first half of the
+      // zoom and only clears near the ends of it. That is where the strip is a
+      // near-match for the desktop behind it and the two can be crossed
+      // without anything being seen to move; earlier in a dive the desktop is
+      // still sliding a workspace in, and a backdrop fading in step with the
+      // progress showed it doing so.
+      opacity: (1 - root.zoomProgress * root.zoomProgress) * root.exitOpacity
     }
 
     MouseArea {
@@ -898,6 +1518,7 @@ Item {
           maxPosition: viewport.centerPositionFor(Math.max(0, root.workspaceRows.length - 1))
           snapStride: root.rowStride
           restPosition: viewport.centerPositionFor(root.selectedRow)
+          frozen: root.viewIsFrozen
           // Undoes Hyprland's global touchpad scroll_factor (Omarchy
           // default 0.4) -- see the property's own comment in
           // KineticScroll.qml.
@@ -979,8 +1600,18 @@ Item {
               // that puts it close enough to matter. Rows are a uniform
               // height, so this is arithmetic rather than a live geometry
               // read — no dependency on delegates existing yet.
+              // This row's share of the dive's scroll; zero for every row but
+              // the one being dived into, and zero at both ends of every other
+              // zoom. See root.aimZoom.
+              readonly property real diveShift: rowItem.index === root.diveRow
+                ? root.diveShiftPx * root.zoomProgress
+                : 0
+
               readonly property real viewportY: rowItem.index * root.rowStride + viewport.columnOffset
-              readonly property bool nearViewport: root.opened
+              // Stays true through the leave: the dive is drawn from these
+              // rows, and a row that decides it is off-screen halfway through
+              // one drops the thumbnail being dived into.
+              readonly property bool nearViewport: (root.opened || root.leaving)
                 && rowItem.viewportY + root.rowHeight > -root.liveMargin
                 && rowItem.viewportY < viewport.height + root.liveMargin
 
@@ -1096,7 +1727,14 @@ Item {
               // and nothing is left coasting behind a closed one.
               Connections {
                 target: root
-                function onOpenedChanged() { rowScroll.reset() }
+                function onViewReset() { rowScroll.reset() }
+                // Whatever the strip was doing — coasting from a flick,
+                // gliding towards a rest position that has just moved — it
+                // stops where it stands when a dive begins. Resetting it, which
+                // is what leaving used to do, snapped it back to its resting
+                // position inside a layer on its way to twice size, in the one
+                // frame that has to be seamless.
+                function onViewFrozen() { rowScroll.stop() }
               }
 
               // Deliberately unlabelled. A workspace name over every row is
@@ -1232,6 +1870,7 @@ Item {
                   // different widths, and a swipe across a row should be able
                   // to stop wherever it likes.
                   restPosition: rowViewport.restX
+                  frozen: root.viewIsFrozen
                   notchPixels: root.rowHeight * 0.6
                   // Undoes Hyprland's global touchpad scroll_factor (Omarchy
                   // default 0.4) -- see the property's own comment in
@@ -1250,7 +1889,7 @@ Item {
                   // workspace's windows all sit inside its monitor the travel
                   // limits collapse onto restX, so this is the centred
                   // position by construction.
-                  x: -rowScroll.position
+                  x: -rowScroll.position - rowItem.diveShift
                   width: rowViewport.contentWidth
                   height: rowViewport.height
 
@@ -1318,6 +1957,14 @@ Item {
                         // needs. A row that goes off-screen keeps the last
                         // frame it captured and resumes streaming before it
                         // comes back into view.
+                        //
+                        // Deliberately still tied to nothing but the row's
+                        // position, right through the leave. Stopping the
+                        // streams the moment a dive starts looks like an
+                        // obvious saving -- they are about to be scaled off the
+                        // edge of the screen -- but it is a change of state at
+                        // the exact frame that has to be unremarkable, on the
+                        // one surface the eye is following.
                         live: rowItem.nearViewport
                         paintCursor: false
                         constraintSize: Qt.size(

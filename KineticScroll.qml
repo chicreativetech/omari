@@ -127,6 +127,17 @@ Item {
   // somewhere — and that should animate.
   property bool interactive: false
 
+  // Pinned: this axis is showing a picture that something else is now drawn
+  // from, and it may not move for any reason at all.
+  //
+  // stop() alone was not that. It ends whatever is running at the instant it
+  // is called, and then the very next thing to touch restPosition -- a rest
+  // position is a *binding*, and the things it is built from keep arriving --
+  // glides the axis somewhere new through onRestPositionChanged. That is a
+  // state, not an event, so it is held as one, and the overview binds it to
+  // its own freeze rather than setting it (see viewIsFrozen there).
+  property bool frozen: false
+
   function clamp(p) { return Math.max(root.minPosition, Math.min(root.maxPosition, p)) }
 
   // The edge `p` has gone past, or undefined if it is in range. Doubles as
@@ -178,7 +189,7 @@ Item {
   // everything. The bounce is what says which of the two it is — and it is
   // also what guarantees a window can never be left parked off the wallpaper.
   function dragBy(delta) {
-    if (delta === 0) return
+    if (root.frozen || delta === 0) return
     // Fingers are back down; whatever the last gesture left coasting is over.
     root.stop()
     root.dragging = true
@@ -205,6 +216,7 @@ Item {
   function endDrag() {
     idle.stop()
     root.dragging = false
+    if (root.frozen) { root.samples = []; return }
     // No `overflows` check here either, and it matters more than in dragBy:
     // this is what hands a drag that went nowhere over to the spring, and
     // returning early would leave the content parked wherever the fingers
@@ -227,7 +239,7 @@ Item {
   // a fixed step on a free one (accumulating onto any glide already in flight
   // so spinning the wheel keeps building speed).
   function stepBy(notches) {
-    if (!root.overflows || notches === 0) return
+    if (root.frozen || !root.overflows || notches === 0) return
     root.interactive = true
 
     if (root.snaps) {
@@ -254,6 +266,7 @@ Item {
   // rather than drags: wheel steps, a snapped gesture's landing point, and
   // restPosition moving under arrow-key navigation.
   function glideTo(target) {
+    if (root.frozen) return
     var t = root.clamp(target)
     root.velocity = 0
     if (Math.abs(t - root.position) < 0.5) {
@@ -381,18 +394,22 @@ Item {
   }
 
   onRestPositionChanged: {
-    if (root.dragging) return
+    if (root.frozen || root.dragging) return
     if (root.interactive) root.glideTo(root.restPosition)
     else root.position = root.clamp(root.restPosition)
   }
 
   function reclamp() {
-    if (root.dragging || runner.running) return
+    if (root.frozen || root.dragging || runner.running) return
     root.position = root.clamp(root.interactive ? root.position : root.restPosition)
   }
 
   onMinPositionChanged: root.reclamp()
   onMaxPositionChanged: root.reclamp()
+
+  // Freezing is also a stop: whatever was coasting or gliding when the click
+  // landed ends where it stands, which is what the capture measured.
+  onFrozenChanged: if (root.frozen) root.stop()
 
   Component.onCompleted: root.position = root.clamp(root.restPosition)
 }
