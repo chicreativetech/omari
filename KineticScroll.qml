@@ -58,6 +58,22 @@ Item {
   // owner can keep its own selection in step with whatever is now centred.
   signal snapped(int index)
 
+  // The free axis' answer to the same question, and it has to be asked at a
+  // different moment. A snapped axis knows its landing point at the release,
+  // before the glide to it has started, so snapped() can fire there; a free
+  // one does not know where it is going until the momentum has run out, the
+  // rubber band has settled, or the glide has arrived. So this fires at rest.
+  //
+  // Only for movement the *user* started. A glide that is merely following
+  // restPosition is the view catching up with a selection that has already
+  // been made, and re-deriving that selection from where it lands is a loop.
+  signal settled()
+
+  // Whether the movement in flight is one that owes a settled() when it ends.
+  // Raised by the two inputs a person can perform, cleared by anything that
+  // cancels rather than completes.
+  property bool announceSettle: false
+
   // ---- feel ----
   // Touchpad drags arrive already scaled by Hyprland's global
   // input.touchpad.scroll_factor (Omarchy default: 0.4, i.e. 40% of the raw
@@ -161,6 +177,7 @@ Item {
   function reset() {
     runner.mode = ""
     runner.running = false
+    root.announceSettle = false
     idle.stop()
     root.velocity = 0
     root.samples = []
@@ -173,8 +190,18 @@ Item {
 
   function stop() {
     root.velocity = 0
+    root.announceSettle = false
     runner.mode = ""
     runner.running = false
+  }
+
+  // stop(), for the case where the movement has *finished* rather than been
+  // called off: the one that owes settled() pays it here. Reading the flag
+  // before stop() clears it is the whole of the difference.
+  function settleNow() {
+    var announce = root.announceSettle
+    root.stop()
+    if (announce) root.settled()
   }
 
   // ---- input ----
@@ -192,6 +219,7 @@ Item {
     if (root.frozen || delta === 0) return
     // Fingers are back down; whatever the last gesture left coasting is over.
     root.stop()
+    root.announceSettle = true
     root.dragging = true
     root.interactive = true
 
@@ -241,6 +269,7 @@ Item {
   function stepBy(notches) {
     if (root.frozen || !root.overflows || notches === 0) return
     root.interactive = true
+    root.announceSettle = true
 
     if (root.snaps) {
       // High-resolution wheels report fractions of a notch, so accumulate
@@ -265,13 +294,16 @@ Item {
   // Ease to an exact offset. The path taken by everything that navigates
   // rather than drags: wheel steps, a snapped gesture's landing point, and
   // restPosition moving under arrow-key navigation.
-  function glideTo(target) {
+  // `quiet` marks a glide that is following restPosition rather than one the
+  // user asked for; see settled().
+  function glideTo(target, quiet) {
     if (root.frozen) return
+    if (quiet) root.announceSettle = false
     var t = root.clamp(target)
     root.velocity = 0
     if (Math.abs(t - root.position) < 0.5) {
       root.position = t
-      root.stop()
+      root.settleNow()
       return
     }
     runner.target = t
@@ -357,7 +389,7 @@ Item {
         root.position += (runner.target - root.position) * kg
         if (Math.abs(runner.target - root.position) < 0.5) {
           root.position = runner.target
-          root.stop()
+          root.settleNow()
         }
         return
       }
@@ -372,13 +404,13 @@ Item {
         root.position += root.velocity * dt
         if (Math.abs(root.position - edge) < 0.5 && Math.abs(root.velocity) < root.minVelocity) {
           root.position = edge
-          root.stop()
+          root.settleNow()
         }
         return
       }
 
       if (Math.abs(root.velocity) < root.minVelocity) {
-        root.stop()
+        root.settleNow()
         return
       }
 
@@ -395,7 +427,7 @@ Item {
 
   onRestPositionChanged: {
     if (root.frozen || root.dragging) return
-    if (root.interactive) root.glideTo(root.restPosition)
+    if (root.interactive) root.glideTo(root.restPosition, true)
     else root.position = root.clamp(root.restPosition)
   }
 

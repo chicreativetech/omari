@@ -88,9 +88,36 @@ Item {
     root.gestureAxis = ""
     vScroll.reset()
     root.viewReset()
+    root.dbg("open focusedWs=" + (focused ? focused.id : "?")
+      + " selectedWsId=" + root.selectedWorkspaceId
+      + " selectedRow=" + root.selectedRow
+      + " selectedApp=" + root.selectedApp
+      + " rows=" + JSON.stringify(root.workspaceRows.map(function(r) { return r.id }))
+      + " frozenRows=" + (root.frozenRows ? "YES" : "no"))
   }
 
-  // The user-facing dismissal, and what the host's hide() reaches: fade, then
+  // What the host's hide() reaches, and so what SUPER+ALT+O reaches: the
+  // keyboard's half of the closing swipe. It lands you on the workspace you
+  // are looking at, with the same dive, for the same reason the swipe does.
+  //
+  // The host's toggle() is `isPluginOpen(id) ? hide(id) : summon(id)` and
+  // never calls the plugin's own toggle(), so hide() is the only place this
+  // can be said. It used to be the plain dismissal below, which meant the key
+  // that had just taken you out to look at workspace 4 put you back down on
+  // the workspace you started from -- no zoom, no switch, nothing to show for
+  // the trip. Enter has always dived; the key that opens now does too.
+  //
+  // Escape and a click on the backdrop go to dismiss() instead and still mean
+  // "never mind". That is the distinction hide() cannot make and the plugin
+  // can: a cancel leaves the desktop exactly as it found it.
+  function close() {
+    if (!root.opened || root.leaving) return
+    // A row with nothing to activate has nowhere to dive, so it leaves the
+    // only way it can.
+    if (!root.activateSelection()) root.dismiss()
+  }
+
+  // The cancel, and the shape every exit still takes underneath: fade, then
   // tear down. A hard unmap reads as a glitch rather than as leaving — one
   // frame an opaque backdrop, the next the desktop — and by the time anyone
   // cancels, the surface is long past the expensive frames that open it and
@@ -106,7 +133,7 @@ Item {
   //
   // The keyboard grab goes back here too rather than at the end, so the window
   // underneath is live again the moment you ask to leave.
-  function close() {
+  function dismiss() {
     if (!root.opened || root.leaving) return
     root.freezeGeometry()
     // `leaving` first, then `opened` -- see panel.visible.
@@ -424,16 +451,19 @@ Item {
     root.selectedApp = Math.max(0, Math.min(apps.length - 1, root.selectedApp + delta))
   }
 
+  // Answers whether it found anything to activate, so a caller with a fallback
+  // of its own -- see toggle() -- can tell "gone there" from "nothing to go to".
   function activateSelection() {
     var row = root.workspaceRows[root.selectedRow]
     if (root.isEmptyRowModel(row)) {
       root.activateWorkspace(row.id)
-      return
+      return true
     }
     var apps = root.selectedToplevels
-    if (apps.length === 0) return
+    if (apps.length === 0) return false
     var i = Math.max(0, Math.min(apps.length - 1, root.selectedApp))
     root.activateToplevel(apps[i], root.selectedRow, i)
+    return true
   }
 
   // ---- zoom ----
@@ -559,13 +589,38 @@ Item {
   // Measures the thumbnail's live on-screen box rather than recomputing the
   // layout from the model, so it stays correct when a row has been scrolled
   // away from its resting position.
+  //
+  // Must be called BEFORE freezeGeometry, and that ordering is the whole of a
+  // dive landing on the row it was aimed at. The freeze hands the Repeater a
+  // fresh array (see frozenRows), which rebuilds every row delegate -- and a
+  // delegate that has just been created has not been positioned by its Column
+  // yet, so it sits at y 0 whatever its index. Measuring there returned the
+  // *first* row's place for whichever row was actually being dived into:
+  //
+  //   probe BEFORE freeze rowY=503 thumbAt=348,251
+  //   probe AFTER  freeze rowY=0   thumbAt=348,-252
+  //
+  // exactly one rowStride out, per row of index. The zoom was then anchored on
+  // row 0's slot, so a dive from any row at all ended with the *first*
+  // workspace filling the screen -- and only a dive from row 0 was ever right,
+  // because there the stale position and the real one are the same number.
+  //
+  // Nothing else the freeze does disturbs the measurement: it stops the
+  // scrollers rather than moving them, and the strips keep their positions
+  // across the rebuild (hPos and stripOffset are unchanged above), so a
+  // capture taken a statement earlier describes the same picture the freeze
+  // then pins.
   function captureZoom(rowIndex, appIndex) {
     var row = rowRepeater.itemAt(rowIndex)
-    if (!row) return false
+    if (!row) { root.dbg("captureZoom: no row delegate at " + rowIndex); return false }
     var item = row.thumbItemAt(appIndex)
-    if (!item || item.width <= 0 || item.height <= 0) return false
+    if (!item || item.width <= 0 || item.height <= 0) {
+      root.dbg("captureZoom: no thumb at " + appIndex
+        + " (item=" + (item ? item.width + "x" + item.height : "null") + ")")
+      return false
+    }
     var r = root.rectFor(item.modelData)
-    if (!r) return false
+    if (!r) { root.dbg("captureZoom: no rect for thumb " + appIndex); return false }
     var p = item.mapToItem(zoomLayer, 0, 0)
     root.zoomThumbX = p.x
     root.zoomThumbY = p.y
@@ -631,16 +686,17 @@ Item {
     root.dbgClickMs = Date.now()
     var arg = root.focusArg(toplevel)
     var tArg = Date.now()
-    root.freezeGeometry()
-    var tFreeze = Date.now()
+    // Measured first, frozen second -- see captureZoom.
     var captured = root.captureZoom(rowIndex, appIndex)
     var tCapture = Date.now()
-    root.dbg("phases focusArg=" + (tArg - root.dbgClickMs) + "ms freeze="
-      + (tFreeze - tArg) + "ms capture=" + (tCapture - tFreeze) + "ms")
     if (!arg || !captured) {
       root.focusToplevel(toplevel)
       return
     }
+    root.freezeGeometry()
+    var tFreeze = Date.now()
+    root.dbg("phases focusArg=" + (tArg - root.dbgClickMs) + "ms capture="
+      + (tCapture - tArg) + "ms freeze=" + (tFreeze - tCapture) + "ms")
     root.dbg("click " + root.dbgCounts()
       + " thumb=(" + Math.round(root.zoomThumbX) + "," + Math.round(root.zoomThumbY) + ")"
       + " capturedReal=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY) + ")"
@@ -858,8 +914,31 @@ Item {
     // So the row performs the same scroll, in miniature, on the same progress
     // the zoom runs on: by the time the transform is at full size the window
     // has moved to its new offset from the wallpaper, and both claims hold.
+    //
+    // Two distances, not one, and missing the second is what made a row with
+    // more windows than fit on its monitor snap back to its opening state the
+    // moment a dive started.
+    //
+    //   the layout's scroll -- how far the compositor is about to carry this
+    //     workspace's columns to bring the focused one into view.
+    //   the row's own offset -- how far the strip already stands from the
+    //     position at which it is a rigid replica of the workspace
+    //     (rowItem.stripOffset).
+    //
+    // The second is not zero as soon as the overview is used. Ring a window
+    // the monitor does not cover and restX nudges the strip by the very scroll
+    // the compositor is about to perform, so the row is *already* showing the
+    // layout the dive is aimed at; adding the first distance on top then
+    // performed that scroll a second time, sliding the windows back past the
+    // wallpaper to where they stood when the overview opened -- while the
+    // wallpaper, which lives outside the strip, stayed put and was carried off
+    // the monitor by the transform. Scrolling a row by hand puts the same
+    // offset there by a different route.
+    //
+    // Subtracting it means the row always ends the dive at its base, which is
+    // the only place the wallpaper and the windows can both be right.
     var pre = root.rectFor(root.pendingActivation)
-    root.diveShiftPx = pre ? (pre.x - r.x) * row.geomScale : 0
+    root.diveShiftPx = (pre ? (pre.x - r.x) * row.geomScale : 0) - row.stripOffset
     // Where that leaves the thumbnail when the ramp is done, which is what the
     // zoom has to be aimed from -- see zoomOffset. At progress 0 the shift is
     // zero and the strip is untouched, so nothing moves under the capture.
@@ -876,13 +955,30 @@ Item {
 
   // The backstop, for a reply that never comes: an overview that has already
   // handed the keyboard back and dispatched its focus cannot be left sitting
-  // on the screen waiting for one. Long enough that the round trip normally
-  // beats it several times over.
-  // Covers the restore wait (see pendingDispatch, ~40-90ms) as well as the
-  // round trip that follows it (~12ms), with room to spare.
+  // on the screen waiting for one.
+  //
+  // Armed twice, and the second time is the one that matters. It used to be
+  // started once, at the click or at the start of the gesture, and sized to
+  // cover the restore wait (see pendingDispatch) *plus* the round trip after
+  // it -- so any overrun in the first came out of the second's budget. Diving
+  // into a window on another workspace overruns both: the focus restore was
+  // measured at ~163ms rather than the ~40ms this was written against, and the
+  // round trip at ~142ms rather than ~12ms, because the dispatch at the head of
+  // that batch is a workspace switch and Hyprland answers the socket around it.
+  // 305ms of arranging against a 200ms deadline meant the deadline fired
+  // *before* the reply, every single time, on every cross-workspace dive:
+  // beginDive ran on an empty string, aimZoom returned without measuring
+  // anything, and the dive silently fell back to the pre-dispatch capture --
+  // exactly the "dived at a place the window was about to stop being" failure
+  // aimZoom exists to end.
+  //
+  // So runPendingDispatch re-arms it when the dispatch actually goes out, and
+  // this is a deadline on the round trip alone. The arming at the click still
+  // stands, and still covers the one thing the other cannot: a restore that
+  // never completes, so the dispatch never leaves.
   Timer {
     id: diveDeadline
-    interval: 200
+    interval: 300
     onTriggered: {
       root.dbg("DEADLINE fired at " + (Date.now() - root.dbgClickMs) + "ms")
       root.beginDive("")
@@ -913,7 +1009,15 @@ Item {
     id: zoomOpener
     running: root.opened && !root.zoomReady
     onTriggered: {
+      root.dbg("zoomOpener frame: selectedRow=" + root.selectedRow
+        + " selectedApp=" + root.selectedApp
+        + " rows=" + JSON.stringify(root.workspaceRows.map(function(r) { return r.id }))
+        + " gestureActive=" + root.gestureActive)
       if (root.captureZoom(root.selectedRow, root.selectedApp)) {
+        root.dbg("zoomOpener captured thumb=("
+          + Math.round(root.zoomThumbX) + "," + Math.round(root.zoomThumbY)
+          + ") real=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY)
+          + ") scale=" + root.zoomScale.toFixed(3))
         root.zoomReady = true
         // A swipe has been driving zoomProgress since before this frame
         // existed, and all it wanted from here was the measurement. Running
@@ -933,6 +1037,7 @@ Item {
         // frame of ramp it is credited with.
         zoomRamp.run(1, 0, root.openMs, null, zoomRamp.maxStep)
       } else {
+        root.dbg("zoomOpener CAPTURE FAILED -- no zoom this open")
         // No zoom to drive, so no gesture to drive it with: the overview
         // simply appears whole, which is what this fallback has always meant.
         // The mode is dropped here rather than left to the fingers lifting,
@@ -1252,25 +1357,38 @@ Item {
       ? (row ? "hl.dsp.focus({ workspace = '" + row.id + "' })" : "")
       : root.focusArg(toplevel)
 
-    if (!arg) return
+    root.dbg("diveBegin row=" + root.selectedRow
+      + " wsId=" + (row ? row.id : "?")
+      + " empty=" + root.isEmptyRowModel(row)
+      + " apps=" + apps.length + " index=" + index
+      + " arg=" + JSON.stringify(arg))
+
+    if (!arg) { root.dbg("diveBegin ABORT: no focus arg"); return }
 
     // The empty row is a workspace with nothing on it, so there is no window to
     // dive into and nothing for the fingers to drive. It still switches — it
     // just decides on release, the way it does from a click.
     if (root.isEmptyRowModel(row) || !toplevel) {
+      root.dbg("diveBegin LEAVE: empty row or no toplevel")
       root.gestureMode = "leave"
       return
     }
 
-    root.freezeGeometry()
+    // Measured first, frozen second -- see captureZoom.
     if (!root.captureZoom(root.selectedRow, index)) {
+      root.dbg("diveBegin LEAVE: captureZoom failed")
       // Nothing measurable to zoom, which is the same position the click path
       // finds itself in and answers the same way: switch on release, plainly.
-      root.thawGeometry()
+      // Nothing to thaw: the freeze has not happened yet.
       root.gestureMode = "leave"
       return
     }
+    root.freezeGeometry()
 
+    root.dbg("diveBegin captured thumb=(" + Math.round(root.zoomThumbX)
+      + "," + Math.round(root.zoomThumbY) + ") real=(" + Math.round(root.zoomRealX)
+      + "," + Math.round(root.zoomRealY) + ") scale=" + root.zoomScale.toFixed(3)
+      + " -- expected thumbY near 247 for the centred row")
     root.gestureMode = "dive"
     root.gestureAimed = false
     root.gestureTravelOrigin = 0
@@ -1325,6 +1443,9 @@ Item {
   }
 
   function gestureDiveFinish(cancelled, timeMs) {
+    root.dbg("diveFinish cancelled=" + cancelled + " mode=" + JSON.stringify(root.gestureMode)
+      + " aimed=" + root.gestureAimed + " progress=" + root.zoomProgress.toFixed(3)
+      + " vel=" + root.gestureVelocity.toFixed(3))
     // Its own modes only; see gestureFinish.
     var mode = root.gestureMode
     if (mode !== "dive" && mode !== "leave") return
@@ -1341,8 +1462,35 @@ Item {
     var resting = root.gestureLastTime > 0 && timeMs > 0
       && (timeMs - root.gestureLastTime) > root.gestureIdleMs
     var speed = resting ? 0 : root.gestureVelocity
+
+    // How far down the fingers ended up, as a fraction of a full zoom, whether
+    // or not the zoom was free to follow them at the time.
+    //
+    // zoomProgress alone is not that, and on a dive it can be a great deal
+    // less. The zoom cannot move until the aim comes back (see
+    // gestureDiveBegin), and gestureTravelOrigin then quite rightly discounts
+    // everything travelled before that so the zoom picks up from where the
+    // fingers are rather than jumping to it. But arranging a dive into another
+    // workspace is not the ~100ms this was written for -- measured at ~305ms,
+    // which on a firm 400px swipe is 288px of it spent standing still. Asking
+    // for a third of a zoom *on top of* that asked for a stroke half again as
+    // long as the same gesture needs anywhere else, and a perfectly ordinary
+    // swipe onto a neighbouring workspace was read as a swipe that had thought
+    // better of it: the overview restored, and the workspace you had plainly
+    // asked for never arrived.
+    //
+    // Travel is the accumulated signed total, so this is not simply "did the
+    // fingers move a lot" -- pushing back up brings it down again, and a swipe
+    // that goes down and returns still reads as cancelled. Where the beat is
+    // short, origin is near zero and this says the same thing zoomProgress
+    // does; it only starts to matter where the overview was too busy to answer.
+    var stroke = root.gestureDistance > 0
+      ? root.gestureLastTravel / root.gestureDistance
+      : 0
+
     var commit = !cancelled
       && (root.zoomProgress >= root.gestureCommitRatio
+        || stroke >= root.gestureCommitRatio
         || speed >= root.gestureFlickSpeed)
 
     if (!root.gestureAimed) {
@@ -1778,6 +1926,8 @@ Item {
     function onRawEvent(event) {
       if (event.name === "activewindow" || event.name === "activewindowv2"
         || event.name === "workspace" || event.name === "workspacev2") {
+        root.dbg("restore via event " + event.name + " at "
+          + (Date.now() - root.dbgClickMs) + "ms")
         root.runPendingDispatch()
       }
     }
@@ -1786,7 +1936,10 @@ Item {
   Timer {
     id: restoreFallback
     interval: 90
-    onTriggered: root.runPendingDispatch()
+    onTriggered: {
+      root.dbg("restoreFallback fired at " + (Date.now() - root.dbgClickMs) + "ms")
+      root.runPendingDispatch()
+    }
   }
 
   function runPendingDispatch() {
@@ -1799,8 +1952,11 @@ Item {
     // longer way round; everything else fires and forgets. The un-dived
     // hand-off starts holding still for the switch from here too, since here
     // is where the switch actually begins.
-    if (root.awaitingLanding) root.dispatchAndAim(arg)
-    else { root.hyprSend("dispatch " + arg); switchHold.restart() }
+    if (root.awaitingLanding) {
+      // From here, and not from the click: see diveDeadline.
+      diveDeadline.restart()
+      root.dispatchAndAim(arg)
+    } else { root.hyprSend("dispatch " + arg); switchHold.restart() }
   }
 
   // A hand-off with no dive behind it: the empty row, or a window whose
@@ -1844,7 +2000,10 @@ Item {
 
   function focusToplevel(hyprlandToplevel) {
     var arg = root.focusArg(hyprlandToplevel)
-    if (!arg) { root.close(); return }
+    // dismiss(), not close(): this is already the fallback *from* activation,
+    // and close() now routes back into it -- which would be a loop, not a
+    // fallback. A window with no address to focus by is nothing to land on.
+    if (!arg) { root.dismiss(); return }
     root.handOff(arg)
   }
 
@@ -1970,10 +2129,11 @@ Item {
       opacity: root.backdropOpacity * root.exitOpacity
     }
 
+    // Clicking past the rows is a cancel, not a choice: nothing was aimed at.
     MouseArea {
       anchors.fill: parent
       visible: root.surfaceLive
-      onClicked: root.close()
+      onClicked: root.dismiss()
     }
 
     Item {
@@ -1993,7 +2153,7 @@ Item {
       Keys.onPressed: function(event) {
         switch (event.key) {
         case Qt.Key_Escape:
-          root.close()
+          root.dismiss()
           break
         case Qt.Key_Up:
           root.moveRow(-1)
@@ -2149,6 +2309,20 @@ Item {
                 ? root.diveShiftPx * root.zoomProgress
                 : 0
 
+              // How far this row's strip stands from the position that draws
+              // its workspace as the compositor actually has it -- see
+              // rowViewport.restXBase. Non-zero in two cases, and the dive has
+              // to undo both: the strip has been scrolled by hand, or restX has
+              // been nudged off the base to bring the ringed window inside the
+              // wallpaper.
+              //
+              // The zoom is one rigid transform over the whole row, wallpaper
+              // included, so it can only put the window on its real place *and*
+              // the wallpaper on the monitor if the two already sit at their
+              // true offset from each other before it runs. Anywhere but the
+              // base they do not. See root.aimZoom.
+              readonly property real stripOffset: rowScroll.position - rowViewport.restXBase
+
               readonly property real viewportY: rowItem.index * root.rowStride + viewport.columnOffset
               // Stays true through the leave: the dive is drawn from these
               // rows, and a row that decides it is off-screen halfway through
@@ -2260,6 +2434,52 @@ Item {
               }
 
 
+              // Which window the ring belongs on for wherever the strip has
+              // been scrolled to. -1 for a row with no windows.
+              //
+              // Deliberately sticky, and restX's inverse: the ring stays where
+              // it is until the window it is on has been scrolled far enough
+              // that its own middle has left the wallpaper, and only then goes
+              // to whatever is nearest the middle now.
+              //
+              // Re-picking on every settle instead reads as a twitch. A
+              // half-width layout shows two columns and neither of them is
+              // centred, so "nearest the middle" disagrees with the focused
+              // window before the strip has moved at all -- and nudging the
+              // strip a few pixels would then flip the ring to the neighbour
+              // and glide the whole row after it. Requiring the ringed window's
+              // middle to actually leave means the selection changes when the
+              // scroll meant it to, and by then restX's nudge lands the strip
+              // about where the fingers left it rather than somewhere else.
+              //
+              // A function rather than a binding on purpose: it walks every
+              // window in the row and rowScroll.position moves every frame of a
+              // gesture, so as a binding it would run the whole loop per frame
+              // for an answer only wanted when the strip stops.
+              function framedIndex() {
+                var vals = rowItem.sortedToplevels
+                if (vals.length === 0) return -1
+                var left = rowScroll.position + rowViewport.monLeft
+                var right = left + rowItem.monWidthPx
+                var middle = (left + right) / 2
+
+                var cur = rowItem.selectedIndex
+                if (cur >= 0 && cur < vals.length) {
+                  var c = rowItem.rectInRow(vals[cur])
+                  var cMid = c.x + c.w / 2
+                  if (cMid >= left && cMid <= right) return cur
+                }
+
+                var best = 0
+                var bestDist = Infinity
+                for (var i = 0; i < vals.length; i++) {
+                  var r = rowItem.rectInRow(vals[i])
+                  var d = Math.abs(r.x + r.w / 2 - middle)
+                  if (d < bestDist) { bestDist = d; best = i }
+                }
+                return best
+              }
+
               // For captureZoom, which needs the thumbnail's real on-screen box
               // and cannot reach into the Repeater from outside.
               function thumbItemAt(i) { return thumbRepeater.itemAt(i) }
@@ -2358,18 +2578,36 @@ Item {
                 readonly property real winRight:
                   (rowItem.winSpan.right - rowItem.strip.left) * rowItem.geomScale
 
-                // Where the strip comes to rest: the *monitor* rectangle over
-                // the wallpaper, not the selected window. That is what makes a
-                // row show what you would actually be looking at were you on
-                // that workspace — windows fall where the layout puts them,
-                // spilling off both edges as they do on a scrolling layout.
+                // The strip position that draws this workspace exactly as the
+                // compositor currently has it: the *monitor* rectangle over the
+                // wallpaper, not the selected window. That is what makes a row
+                // show what you would actually be looking at were you on that
+                // workspace — windows fall where the layout puts them, spilling
+                // off both edges as they do on a scrolling layout.
                 //
-                // Nudged off that only as far as it must be to bring the ringed
-                // window inside the wallpaper, for when left/right has walked
-                // past the part of the strip the monitor covers.
+                // Named on its own because it is not only where the strip rests.
+                // It is the one position at which the row is a *rigid* replica
+                // of the workspace — window offsets from the wallpaper equal to
+                // window offsets from the monitor — and the dive's single
+                // transform can only land the windows and the wallpaper at once
+                // from there. See rowItem.stripOffset.
+                readonly property real restXBase:
+                  (rowItem.monX - rowItem.strip.left) * rowItem.geomScale
+                    - rowViewport.monLeft
+
+                // Where the strip comes to rest: restXBase, nudged off it only
+                // as far as it must be to bring the ringed window inside the
+                // wallpaper, for when the selection has walked past the part of
+                // the strip the monitor covers.
+                //
+                // That nudge is a model of what the compositor does when the
+                // ringed window is focused -- a scrolling layout brings the
+                // focused column into view with the smallest scroll that will
+                // do it -- which is why the dive has to treat it as travel the
+                // row has *already* performed rather than as travel still to
+                // come.
                 readonly property real restX: {
-                  var monOffset = (rowItem.monX - rowItem.strip.left) * rowItem.geomScale
-                  var pos = monOffset - rowViewport.monLeft
+                  var pos = rowViewport.restXBase
                   var vals = rowItem.sortedToplevels
                   var i = rowItem.selectedIndex
                   if (i < 0 || i >= vals.length) return pos
@@ -2418,6 +2656,27 @@ Item {
                   // default 0.4) -- see the property's own comment in
                   // KineticScroll.qml.
                   dragScale: 4
+
+                  // Scrolling a row sideways selects, exactly as scrolling the
+                  // workspace list vertically does (see vScroll.onSnapped).
+                  // Without this the horizontal axis was the one thing in the
+                  // overview you could change that changed nothing: the strip
+                  // moved, the ring stayed where it was, and the dive focused
+                  // the window that was already focused -- so the workspace you
+                  // landed on was the one you had before you scrolled at all.
+                  //
+                  // The compositor has no dispatcher for "scroll this workspace
+                  // to here"; a scrolling layout is scrolled by focusing
+                  // something. So what carries across is the selection, and
+                  // restX then glides the strip to the scroll the compositor
+                  // will really perform for it -- which is the truth about
+                  // where the dive is going, and is the same nudge the dive
+                  // itself now reads back off rowItem.stripOffset.
+                  onSettled: {
+                    if (!rowItem.current || root.viewIsFrozen || !root.opened) return
+                    var i = rowItem.framedIndex()
+                    if (i >= 0) root.selectedApp = i
+                  }
                 }
 
                 // The strip: every window on the workspace at its real position
@@ -2621,7 +2880,14 @@ Item {
                 gestureIdle.stop()
                 if (hDrag) hDrag.endDrag()
               } else if (hDrag) {
-                hDrag.dragBy(-wheel.pixelDelta.x)
+                // Not negated, unlike the vertical axis below: niri moves the
+                // *strip* under two fingers rather than the view over it, so
+                // swiping left carries the columns left and brings the one to
+                // the right into the centre. Matching it here matters more
+                // than matching the axis beside it, because this is the same
+                // gesture, on the same strip of columns, that the scrolling
+                // layout answers when the overview is closed.
+                hDrag.dragBy(wheel.pixelDelta.x)
               }
               wheel.accepted = true
               return
@@ -2632,12 +2898,12 @@ Item {
               gestureIdle.stop()
               vScroll.endDrag()
             } else {
-              // Negated, like every other axis here: two fingers drag the
-              // *view over the stack of workspaces* rather than the stack
-              // itself, so pushing up brings the row above into the centre.
-              // Same sense as the horizontal drag beside it and the mouse
-              // wheel above, so nothing in the overview reverses direction
-              // depending on which way you happen to be swiping.
+              // Negated: two fingers drag the *view over the stack of
+              // workspaces* rather than the stack itself, so pushing up
+              // brings the row above into the centre. Same sense as the
+              // mouse wheel above. The horizontal drag is the odd one out
+              // on purpose -- it follows niri, which has no opinion about
+              // this axis because it has no vertical stack.
               vScroll.dragBy(-wheel.pixelDelta.y)
             }
             wheel.accepted = true
