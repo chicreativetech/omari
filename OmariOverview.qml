@@ -26,6 +26,13 @@ Item {
 
   property bool opened: false
 
+  // Whether the surface is showing anything at all. The layer surface itself
+  // stays mapped from the moment the shell starts — see panel.visible, which
+  // is what lets the opening swipe track the fingers from the first
+  // millimetre — so "is the window up" stopped being the same question as "is
+  // the overview up", and everything that means the second one asks this.
+  readonly property bool surfaceLive: root.opened || root.leaving
+
   // ---- selection ----
   //
   // The whole overview hangs off these two. The selected workspace is stored
@@ -121,6 +128,14 @@ Item {
     root.grabsKeyboard = true
     root.exitOpacity = 1
     root.gestureAxis = ""
+    // Any swipe still thought to own the overview does not, now that there is
+    // no overview for it to own. Everything that tears the surface down
+    // arrives here, so this is the one place that covers a gesture outliving
+    // what it was driving -- Escape or a click landing between the fingers
+    // moving and the fingers lifting. Without it those last few events would
+    // go on writing zoomProgress on a closed overview, and the release would
+    // ramp it back open.
+    root.gestureMode = ""
     geometryRefresh.stop()
     root.clearZoom()
     root.thawGeometry()
@@ -466,6 +481,13 @@ Item {
   // is a few pixels of creep, which is what the beat after the dive is for.
   readonly property int diveMs: 300
 
+  // The other direction: falling back out of the window into the overview.
+  // Shorter than the dive because it has nothing to stay in step with — the
+  // dive is timed to the workspace slide running behind it, this is timed to
+  // itself. Also what the tail of a released swipe is measured against; see
+  // gestureFinish.
+  readonly property int openMs: 260
+
   // Frame and phase tracing for the open/dive transitions, off by default.
   // Turning it on prints the timings that found the unmap described at
   // panel.visible: how long each phase of the click took, when Hyprland's
@@ -486,6 +508,42 @@ Item {
   }
 
   readonly property real zoomFactor: 1 + root.zoomProgress * (root.zoomScale - 1)
+
+  // ---- the backdrop's own curve ----
+  //
+  // The two directions of the zoom want opposite things from the backdrop, and
+  // for a while they shared one curve because one of them was too quick to
+  // argue with.
+  //
+  // Diving, the desktop underneath is *moving* — the workspace slide the click
+  // dispatched is running behind the overlay, and that is the thing the
+  // overview is up to hide. So the backdrop stays opaque through almost all of
+  // it and only clears at the very end, where the strip has become a near-match
+  // for the desktop behind it and the two can be crossed without anything being
+  // seen to move. A backdrop clearing in step with the progress showed the
+  // workspace sliding in behind a half-transparent overview.
+  //
+  // Opening, the desktop underneath is *still*, and the strip is pulling away
+  // from it. Everything the strip uncovers as it shrinks is the real desktop
+  // showing through, in register with the replica drawn on top of it — two
+  // copies of the same picture at different sizes. Squared, the backdrop is
+  // barely there for the first third of the pull-back, which was invisible at
+  // 260ms and is not invisible at all when the fingers hold the zoom halfway
+  // out. So this direction hides the desktop almost at once instead: within
+  // backdropRise of leaving progress 1, which is a few tens of pixels of
+  // travel. It cannot simply start opaque — at progress 1 exactly the strip
+  // stands in for the desktop pixel for pixel, and painting over it there would
+  // put a grey flash at both ends of every swipe.
+  readonly property real backdropRise: 0.1
+
+  // Whether a dive is what is driving the zoom rather than an open or a swipe.
+  // pendingActivation is set for the whole of one, from the click until
+  // clearZoom, and for nothing else.
+  readonly property bool diving: root.pendingActivation !== null
+
+  readonly property real backdropOpacity: root.diving
+    ? 1 - root.zoomProgress * root.zoomProgress
+    : Math.min(1, (1 - root.zoomProgress) / root.backdropRise)
 
   // Ramping the scale alone would drag the target away from both endpoints in
   // between; this holds its top-left on the straight line from thumbnail to
@@ -850,6 +908,11 @@ Item {
     onTriggered: {
       if (root.captureZoom(root.selectedRow, root.selectedApp)) {
         root.zoomReady = true
+        // A swipe has been driving zoomProgress since before this frame
+        // existed, and all it wanted from here was the measurement. Running
+        // the ramp as well would put two writers on the same property, and
+        // the one that is not the fingers would win.
+        if (root.gestureActive) return
         // One capped step in, rather than at the very start. The frame this
         // runs for is the first one the compositor can show, and at progress 1
         // the strip is a pixel-exact stand-in for the window it covers — so
@@ -861,8 +924,14 @@ Item {
         // either: a good fraction of a second of real time passed while the
         // surface was being mapped, which is a great deal more than the one
         // frame of ramp it is credited with.
-        zoomRamp.run(1, 0, 260, null, zoomRamp.maxStep)
+        zoomRamp.run(1, 0, root.openMs, null, zoomRamp.maxStep)
       } else {
+        // No zoom to drive, so no gesture to drive it with: the overview
+        // simply appears whole, which is what this fallback has always meant.
+        // The mode is dropped here rather than left to the fingers lifting,
+        // because a swipe still thought to be in flight would be read as a
+        // dismissal when it ended and close the overview it had just opened.
+        root.gestureMode = ""
         root.clearZoom()
       }
     }
@@ -963,6 +1032,171 @@ Item {
       var done = zoomRamp.whenDone
       zoomRamp.whenDone = null
       if (done) done()
+    }
+  }
+
+  // ---- the opening swipe ----
+  //
+  // The 4-finger swipe does not start the opening zoom, it *is* the opening
+  // zoom. zoomProgress is written straight from how far the fingers have
+  // travelled, so the overview pulls back under them and stands wherever they
+  // stand; letting go only finishes the direction it was already going, and
+  // pushing back down before letting go returns the desktop without the
+  // overview ever having committed to opening. That is the whole difference
+  // between this and an animation a gesture triggers.
+  //
+  // The compositor does the tracking. Hyprland's Lua gestures take a table of
+  // start/update/finish callbacks rather than one function, and hypr/
+  // omari-overview.lua turns each update into a `custom` line on the event
+  // socket carrying the accumulated upward travel in pixels. This end turns
+  // pixels into progress, because this end is the one that knows how tall the
+  // screen is and what the overview is currently doing.
+  //
+  // None of it would be worth having without panel.visible: a swipe that has
+  // to wait for a layer surface to be mapped is a swipe that does nothing for
+  // a third of a second and then jumps.
+
+  // "" when no swipe owns the overview, "open" while one is driving
+  // zoomProgress, "dismiss" for one that arrived on an overview already up.
+  // Decided when the swipe starts and never re-read: a gesture that begins as
+  // a dismissal stays one however far the fingers then wander, which is what
+  // stops a wobble halfway through from changing what letting go will mean.
+  property string gestureMode: ""
+  readonly property bool gestureActive: root.gestureMode === "open"
+
+  // Finger travel for a full zoom out. A fraction of the screen rather than a
+  // pixel count, for the same reason rowHeight is one: the gesture should ask
+  // for the same *stroke* on a laptop panel and on a large monitor. The floor
+  // keeps it sane before the surface has been given its size.
+  readonly property real gestureDistance: Math.max(Style.space(180), panel.height * 0.3)
+
+  // What counts as meaning it. Either the overview is a third of the way out,
+  // or the fingers were still moving fast enough at the moment they lifted —
+  // the second is what lets a quick flick open it without dragging all the
+  // way, and it is measured over the last events rather than across the whole
+  // swipe, so a fast stroke that stops dead before lifting does not count.
+  readonly property real gestureCommitRatio: 0.32
+  readonly property real gestureFlickSpeed: 0.4   // px per ms
+
+  // How long after the last movement the fingers still count as travelling.
+  // A touchpad only reports motion, so a swipe that stops on the pad and is
+  // held there sends nothing at all, and the last speed measured stays on the
+  // books however long it is held. Without this, swiping a couple of
+  // centimetres, resting, and letting go would be read as the flick the swipe
+  // *started* as, and would open an overview the fingers had plainly decided
+  // against.
+  readonly property int gestureIdleMs: 50
+
+  property real gestureVelocity: 0
+  property real gestureLastTravel: 0
+  property real gestureLastTime: 0
+
+  function gestureBegin() {
+    if (root.gestureMode !== "") return
+    // A dive owns zoomProgress from the click until the surface goes away and
+    // a fade owns the surface itself. Neither wants a second writer, and a
+    // swipe arriving on one is a swipe at nothing in particular.
+    if (root.leaving || root.pendingActivation) return
+    if (root.opened) { root.gestureMode = "dismiss"; return }
+
+    root.gestureMode = "open"
+    root.gestureVelocity = 0
+    root.gestureLastTravel = 0
+    root.gestureLastTime = 0
+    root.open()
+    // No keyboard grab yet. Taking one makes Hyprland restore focus when it
+    // is handed back ~40ms later (see pendingDispatch), and a swipe that is
+    // pushed back down before it commits should cost the window underneath
+    // nothing whatsoever. The grab is taken when the open is committed.
+    root.grabsKeyboard = false
+  }
+
+  function gestureAt(travel, timeMs) {
+    if (!root.gestureActive) return
+    if (root.gestureLastTime > 0 && timeMs > root.gestureLastTime) {
+      // Half the running value, half the new reading, rather than the reading
+      // alone: a touchpad puts the occasional 1px event between two 20px ones,
+      // and a raw speed sampled at the instant the fingers lift is as likely
+      // to catch one of those as not — which would turn a genuine flick into
+      // a revert.
+      root.gestureVelocity = 0.5 * root.gestureVelocity
+        + 0.5 * (travel - root.gestureLastTravel) / (timeMs - root.gestureLastTime)
+    }
+    root.gestureLastTravel = travel
+    root.gestureLastTime = timeMs
+    // Clamped rather than wrapped or rubber-banded: past a full zoom there is
+    // nothing further out to show, and short of zero the desktop is already
+    // all there is.
+    root.zoomProgress = 1 - Math.max(0, Math.min(1, travel / root.gestureDistance))
+  }
+
+  function gestureFinish(cancelled, timeMs) {
+    var mode = root.gestureMode
+    root.gestureMode = ""
+
+    if (mode === "dismiss") {
+      // What a 4-finger swipe has always done to an overview that is already
+      // up. Deliberately *not* tracked 1:1 on the way out: leaving is a dive
+      // into whichever window the overview is centred on, and where that
+      // window is about to be is not known until the focus dispatch has landed
+      // (see aimZoom). The swipe is a decision; the dive answers it.
+      if (!cancelled) root.close()
+      return
+    }
+    if (mode !== "open") return
+
+    var resting = root.gestureLastTime > 0 && timeMs > 0
+      && (timeMs - root.gestureLastTime) > root.gestureIdleMs
+    var speed = resting ? 0 : root.gestureVelocity
+
+    var shown = 1 - root.zoomProgress
+    var commit = !cancelled
+      && (shown >= root.gestureCommitRatio || speed >= root.gestureFlickSpeed)
+
+    // Both tails are timed by what is left to travel rather than by a fixed
+    // duration. Releasing at nine tenths open and then watching a full-length
+    // ramp play out the last tenth reads as the overview hesitating after the
+    // fingers have already finished with it. The floor is there so that a
+    // release at the very end is still a frame or two of motion and not a cut.
+    if (commit) {
+      root.grabsKeyboard = true
+      zoomRamp.run(root.zoomProgress, 0,
+        Math.round(root.openMs * Math.max(0.15, root.zoomProgress)), null)
+    } else {
+      // Straight to finish() and not through close(): the exit fade exists to
+      // keep a dismissal from cutting, and there is nothing here to cut. At
+      // progress 1 the strip is already a pixel-exact stand-in for the desktop
+      // underneath it, so the surface can simply stop being drawn.
+      zoomRamp.run(root.zoomProgress, 1,
+        Math.round(root.openMs * Math.max(0.15, 1 - root.zoomProgress)),
+        root.finish)
+    }
+  }
+
+  // Deliberately not gated on `opened`, unlike the geometry listener above:
+  // the first event of a swipe arrives while the overview is still down, and
+  // that is the entire point of it.
+  //
+  // `custom` is what hl.dsp.event puts on the socket, and every shell on the
+  // machine sees all of them — hence the prefix test before anything is parsed.
+  Connections {
+    target: Hyprland
+    function onRawEvent(event) {
+      if (event.name !== "custom") return
+      var data = String(event.data || "")
+      if (data.indexOf("omari:overview-") !== 0) return
+      var parts = data.split(" ")
+      switch (parts[0]) {
+      case "omari:overview-begin":
+        root.gestureBegin()
+        break
+      case "omari:overview-at":
+        root.gestureAt(Number(parts[1]), Number(parts[2]))
+        break
+      case "omari:overview-end":
+        root.gestureFinish(parts[1] === "1", Number(parts[2]))
+        break
+      }
     }
   }
 
@@ -1373,45 +1607,94 @@ Item {
 
   PanelWindow {
     id: panel
-    // `leaving` keeps the surface up through the exit fade and through the
-    // beat handOff holds it for; see close() for why `opened` cannot.
+    // Mapped once, at shell start, and never unmapped.
     //
-    // Every writer of that pair must raise the new flag before it drops the
-    // old one, and this is the whole reason why. QML evaluates a binding
-    // synchronously the instant a dependency is assigned, so `opened = false`
-    // followed by `leaving = true` is not one transition but two: for the
-    // width of those two statements this reads false, and Qt takes it at its
-    // word. A layer-shell surface set invisible is unmapped there and then,
-    // and bringing it back is a fresh surface with a fresh configure -- a
-    // blocking round trip to a compositor that, at exactly that moment, is
-    // busy animating the workspace switch the click just dispatched. It cost
-    // ~650ms of dead event loop on every click: the dive's own 120ms deadline
-    // timer fired at 799ms, the Hyprland reply the dive is aimed from sat
-    // unread in the socket for 700ms (0.2ms to answer when it is actually
-    // read), and every ScreencopyView in here was torn down and rebuilt for
-    // the privilege. That was the stutter, and the jump was the desktop
-    // showing through the gap.
-    visible: root.opened || root.leaving
+    // This used to be `root.opened || root.leaving`, and unmapping was
+    // expensive in a way that was easy to underestimate. Mapping a fresh
+    // full-screen layer surface costs two frames measured at ~200ms each here
+    // (see zoomOpener), and bringing one back is a fresh configure -- a
+    // blocking round trip to a compositor that, on a click, is at exactly that
+    // moment busy animating the workspace switch the click just dispatched. It
+    // cost ~650ms of dead event loop: the dive's own deadline timer fired at
+    // 799ms, the Hyprland reply the dive is aimed from sat unread in the socket
+    // for 700ms (0.2ms to answer when it is actually read), and every
+    // ScreencopyView in here was torn down and rebuilt for the privilege.
+    //
+    // Holding it up was already worth it for that alone, and it is what the
+    // opening swipe rests on: a gesture cannot track fingers 1:1 through a
+    // third of a second of surface creation, it can only sit still and then
+    // jump to wherever they got to. With the surface already up, the first
+    // event of a swipe finds a laid-out scene it can measure and start moving
+    // on the same frame.
+    //
+    // Nothing is drawn, clickable or focusable while the overview is down --
+    // see the layer and mask below and `visible` on the children -- so what is
+    // left mapped is an empty transparent surface on a layer nothing looks at.
+    //
+    // The `opened`/`leaving` pair still matters for exactly the reason it
+    // always did, and every writer of it must still raise the new flag before
+    // dropping the old one: QML evaluates a binding synchronously the instant a
+    // dependency is assigned, so `opened = false` followed by `leaving = true`
+    // is not one transition but two, and for the width of those two statements
+    // surfaceLive reads false. It no longer unmaps anything, but it does blank
+    // the overview for a frame in the middle of a dive.
+    visible: true
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     WlrLayershell.namespace: "omari-overview"
-    WlrLayershell.layer: WlrLayer.Overlay
+    // Overlay only while it is actually showing something.
+    //
+    // A mapped overlay layer is not free even when it draws nothing: Hyprland
+    // refuses direct scanout on any monitor that has one at all
+    // (CMonitor::isSolitaryBlocked checks the overlay list for emptiness, and
+    // unlike the top layer beside it does not look at alpha), and refuses
+    // tearing along with it. Leaving this on the overlay layer permanently
+    // would cost every fullscreen game and video on the machine its scanout
+    // path, forever, to save the overview a few hundred milliseconds.
+    //
+    // Parked on the background layer it is not looked at by any of that. The
+    // change is cheap in the way that matters: Quickshell applies it as a plain
+    // set_layer on the surface that is already up (LayerSurface::setState in
+    // wlr_layershell/surface.cpp) rather than by remapping, so the raise costs
+    // a commit and not two 200ms frames -- which is the whole reason this trade
+    // is available.
+    WlrLayershell.layer: root.surfaceLive ? WlrLayer.Overlay : WlrLayer.Background
     // Dropped the moment the overview starts leaving, by either route: a
     // dismissal wants the window underneath live again straight away, and a
     // hand-off needs the grab gone before its dispatch goes out. See handOff.
-    WlrLayershell.keyboardFocus: root.grabsKeyboard
+    //
+    // Gated on surfaceLive as well, and that is not belt and braces: finish()
+    // puts grabsKeyboard back up ready for the next open, and on a surface that
+    // no longer unmaps to end the grab, this would hold exclusive keyboard
+    // focus over the whole desktop from the first close onwards.
+    WlrLayershell.keyboardFocus: (root.surfaceLive && root.grabsKeyboard)
       ? WlrKeyboardFocus.Exclusive
       : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
+
+    // Nothing at all is clickable while the overview is down. The surface
+    // covers the screen the whole time it is up, which is now all of the time,
+    // so without this the desktop under it would stop taking clicks the moment
+    // the shell started. An empty region is the documented way to ask for that:
+    // Quickshell sets Qt::WindowTransparentForInput for a mask that is present
+    // but empty, and treats a null mask as "the whole window".
+    property Region noInput: Region {}
+    mask: root.surfaceLive ? null : panel.noInput
     // Same workaround as the background layer (Background.qml): a
     // layer-shell surface that toggles visible has been observed to come
-    // back showing its last committed frame instead of a fresh one. This
-    // surface is only ever composited while it is visible above, so keeping
-    // updates enabled unconditionally costs nothing while closed.
+    // back showing its last committed frame instead of a fresh one. The
+    // surface no longer toggles at all, and its children draw nothing while
+    // the overview is down, so this costs nothing while closed.
     updatesEnabled: true
 
     Rectangle {
       anchors.fill: parent
+      // The three children below are what the surface actually shows, and none
+      // of them exists as far as the renderer is concerned while the overview
+      // is down -- which is what makes an always-mapped surface affordable.
+      // `visible` and not `opacity`, deliberately: an item at zero opacity is
+      // still laid out, still batched and still drawn.
+      visible: root.surfaceLive
       // Flat, opaque, and *lighter* than the theme's Color.background, not
       // darker. The overview is nothing but dark app thumbnails, and the
       // wallpaper thumbnail behind each row carries its own drop shadow —
@@ -1421,28 +1704,30 @@ Item {
       // real desktop show through put live wallpaper detail directly behind
       // thumbnails of that same wallpaper.
       color: Qt.lighter(Color.background, 1.75)
-      // Fades out as the view dives into a window, so what the strip is
-      // growing against is the real desktop it is about to become — and again,
-      // through exitOpacity, on the way out of a dismissal.
-      //
-      // Squared, so it is still nearly opaque through the first half of the
-      // zoom and only clears near the ends of it. That is where the strip is a
-      // near-match for the desktop behind it and the two can be crossed
-      // without anything being seen to move; earlier in a dive the desktop is
-      // still sliding a workspace in, and a backdrop fading in step with the
-      // progress showed it doing so.
-      opacity: (1 - root.zoomProgress * root.zoomProgress) * root.exitOpacity
+      // Clears as the view dives into a window, so what the strip is growing
+      // against is the real desktop it is about to become, and comes up almost
+      // at once as the view pulls back out of one, so nothing is ever seen
+      // twice over. The two directions do not share a curve; see
+      // root.backdropOpacity for why they cannot. Fades again, on top of
+      // either, through exitOpacity on the way out of a dismissal.
+      opacity: root.backdropOpacity * root.exitOpacity
     }
 
     MouseArea {
       anchors.fill: parent
+      visible: root.surfaceLive
       onClicked: root.close()
     }
 
     Item {
       id: keyCatcher
       anchors.fill: parent
-      focus: panel.visible
+      visible: root.surfaceLive
+      // Was panel.visible, which is now simply always true. The grab is only
+      // ever held while the overview is up (see keyboardFocus above), so this
+      // is the same statement it always was, said about the overview instead
+      // of about the window.
+      focus: root.opened
       // The strip's half of the exit fade; the backdrop above carries the
       // other half. Both are children of the window rather than of one item,
       // so the fade is applied to each rather than to the pair.
@@ -1611,7 +1896,7 @@ Item {
               // Stays true through the leave: the dive is drawn from these
               // rows, and a row that decides it is off-screen halfway through
               // one drops the thumbnail being dived into.
-              readonly property bool nearViewport: (root.opened || root.leaving)
+              readonly property bool nearViewport: root.surfaceLive
                 && rowItem.viewportY + root.rowHeight > -root.liveMargin
                 && rowItem.viewportY < viewport.height + root.liveMargin
 

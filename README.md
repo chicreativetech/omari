@@ -4,7 +4,8 @@ A plugin for Omarchy that adds Niri-like functionality: an Omarchy shell
 bar plugin that toggles Hyprland's native `scrolling` layout, a 3-finger
 horizontal swipe, column-aware `SUPER+arrows` focus that doesn't disappear
 behind a maximized column, and `SUPER+PageDown`/`SUPER+PageUp` workspace
-switching — plus a niri-style overview, opened with a 4-finger swipe up or
+switching — plus a niri-style overview, opened with a stageless 4-finger swipe
+up (the zoom tracks your fingers and reverses if you push back down) or
 `SUPER+ALT+O`, showing every workspace as a row of live window thumbnails.
 
 ## What it does
@@ -159,21 +160,108 @@ Two things here are easy to get wrong and were both got wrong first:
   `transformOrigin: Item.TopLeft` instead, which is exactly `s*p + t` with no
   order to get wrong.
 
+**The backdrop's two directions do not share a curve.** They ask for opposite
+things, and for a while they shared one because the opening was too quick to
+argue with.
+
+Diving, the desktop underneath is *moving* — the workspace slide the click
+dispatched is running behind the overlay, and hiding it is what the overlay is
+for. So the backdrop holds opaque through almost all of the dive (`1 - p²`) and
+clears only at the very end, where the strip has become a near-match for the
+desktop behind it and the two can be crossed without anything being seen to
+move. Clearing in step with the progress instead showed the workspace sliding in
+behind a half-transparent overview.
+
+Opening, the desktop underneath is *still*, and the strip is pulling away from
+it — so everything the strip uncovers as it shrinks is the real desktop showing
+through, in register with the replica drawn on top of it. Two copies of the same
+picture at different sizes. Squared, the backdrop is barely there for the first
+third of the pull-back, which nobody could see at 260ms and everybody can see
+when the fingers hold the zoom halfway out. This direction goes opaque within
+`backdropRise` (0.1) of leaving progress 1 instead — a few tens of pixels of
+travel. It cannot simply *start* opaque: at progress 1 exactly the strip stands
+in for the desktop pixel for pixel, and painting over it there would put a grey
+flash at both ends of every swipe.
+
 Escape and a background click do not dive — there is no window being dived
 into — but they do not cut away either: the whole overlay fades over 110ms and
-then unmaps. `opened` goes false at the *start* of that fade and the surface is
-held up by a separate `leaving` flag, because `opened` is what the host answers
-"is this plugin open?" with: leaving it true would swallow a swipe arriving
-during the fade, which is exactly where one arrives. As it stands that swipe
-reopens a surface that never unmapped, which is instant.
+then stops drawing. `opened` goes false at the *start* of that fade and the
+surface is held up by a separate `leaving` flag, because `opened` is what the
+host answers "is this plugin open?" with: leaving it true would swallow a swipe
+arriving during the fade, which is exactly where one arrives. As it stands that
+swipe reopens a surface that was never torn down, which is instant.
+
+## The opening swipe
+
+The 4-finger swipe does not *start* the opening zoom, it **is** the opening
+zoom. `zoomProgress` is written straight from how far the fingers have
+travelled, so the overview pulls back under them and stands wherever they
+stand; letting go only finishes the direction it was already going, and pushing
+back down before letting go returns the desktop without the overview ever
+having committed to opening. This is niri's behaviour, and it is the whole
+difference between a stageless gesture and an animation a gesture triggers.
+
+Hyprland does the tracking. `hl.gesture` takes a table of `start`/`update`/
+`finish` callbacks rather than a single function, and calls them for every
+trackpad event of the gesture instead of once when it completes.
+`hypr/omari-overview.lua` accumulates the travel — `delta` is the *per-event*
+delta, not the running total — and puts it on Hyprland's event socket with
+`hl.dsp.event`, one `custom>>` line per update. That is cheap enough to do at
+touchpad rate, which spawning a process per frame very much is not. Only the
+raw pixel travel is sent: turning it into a fraction of a zoom wants the height
+of the screen and the state of the overview, and both live at the QML end.
+
+The gesture is registered as `up`, not `vertical`, so a downward 4-finger swipe
+still matches nothing, exactly as before. That does not stop a swipe being
+*reversed*: Hyprland picks the matching gesture once, on the first 5px of
+travel, and keeps feeding that one every event afterwards whichever way the
+fingers then go.
+
+Releasing commits if the overview is a third of the way out, **or** if the
+fingers were still moving fast enough when they lifted — the second is what
+lets a quick flick open it without dragging all the way. The release timestamp
+is part of the event for a reason: a touchpad reports only motion, so a swipe
+that stops on the pad and is held there sends nothing at all and the last speed
+measured would otherwise stay on the books however long it was held. A gap
+wider than 50ms between the last movement and the release means the fingers had
+come to rest, and only the distance counts.
+
+A swipe arriving on an overview that is *already* up dismisses it, on release,
+as it always did. That direction is deliberately not tracked 1:1: leaving is a
+dive into whichever window the overview is centred on, and where that window is
+about to be is not known until the focus dispatch has landed. The swipe is a
+decision; the dive answers it.
 
 ## Opening cost
 
-Opening the overview means mapping a fresh full-screen layer-shell surface, and
-the two frames that takes were measured at **~200ms each**. That cost is in the
-surface, not in what is drawn on it: taking the row shadows out of the scene,
-then the screencopy streams, then the wallpaper, each changed it by nothing.
-Two things follow.
+Opening the overview used to mean mapping a fresh full-screen layer-shell
+surface, and the two frames that takes were measured at **~200ms each**. That
+cost is in the surface, not in what is drawn on it: taking the row shadows out
+of the scene, then the screencopy streams, then the wallpaper, each changed it
+by nothing.
+
+**So the surface is never unmapped.** It is created once at shell start and
+kept, because a gesture cannot track fingers 1:1 through a third of a second of
+surface creation — it can only sit still and then jump to wherever they got to.
+With the surface already up, the first event of a swipe finds a laid-out scene
+it can measure and start moving on the same frame.
+
+Keeping it costs nothing to look at — the children draw nothing while the
+overview is down (`visible: false`, not `opacity: 0`, which is still laid out
+and still drawn), an empty `mask` region makes the whole screen click through
+it, and the keyboard grab is gated on the overview being up rather than on the
+window existing. But it is not free on the *compositor* side: Hyprland refuses
+direct scanout on any monitor that has a mapped overlay-layer surface at all
+(`CMonitor::isSolitaryBlocked` checks that list for emptiness and, unlike the
+top layer beside it, does not look at alpha), and refuses tearing along with it.
+Left on the overlay layer permanently this would cost every fullscreen game and
+video on the machine its scanout path, forever, to save the overview a few
+hundred milliseconds. So it is *parked on the background layer* while the
+overview is down and raised to overlay when it goes up — a layer nothing in
+that check looks at. Quickshell applies the change as a plain `set_layer` on
+the surface that is already up rather than by remapping, so the raise costs a
+commit and not two 200ms frames, which is the whole reason the trade is
+available.
 
 The plugin is `keepLoaded`, so the QML is instantiated once at shell start
 rather than on every summon — worth another ~250ms per open, measured — and the
@@ -209,7 +297,7 @@ between the dive ending and the new one arriving. Setting `keyboardFocus` to
 `None` hands the grab back without unmapping, so the dispatch is the last word
 and the surface can stay up across the switch — holding its final zoomed frame,
 which is the destination window at real size in its real place, so what it
-covers is exactly the switch. It unmaps 110ms later.
+covers is exactly the switch. It stops drawing 110ms later.
 
 The dispatch is spawned bare rather than through `Util.execArgv`, which runs
 everything under `bash -lc`. A login shell costs **~280ms** here sourcing
