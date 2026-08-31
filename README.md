@@ -2,10 +2,10 @@
 
 A plugin for Omarchy that adds Niri-like functionality: an Omarchy shell
 bar plugin that toggles Hyprland's native `scrolling` layout, a 3-finger
-horizontal swipe, and column-aware `SUPER+arrows` focus that doesn't
-disappear behind a maximized column — plus a niri-style overview, opened
-with a 4-finger swipe up or `SUPER+ALT+O`, showing every workspace as a row
-of live window thumbnails.
+horizontal swipe, column-aware `SUPER+arrows` focus that doesn't disappear
+behind a maximized column, and `SUPER+PageDown`/`SUPER+PageUp` workspace
+switching — plus a niri-style overview, opened with a 4-finger swipe up or
+`SUPER+ALT+O`, showing every workspace as a row of live window thumbnails.
 
 ## What it does
 
@@ -18,6 +18,14 @@ Hyprland's scrolling layout has its own layout-aware focus command
 it into view even when the current column is maximized, without clearing
 that column's maximized state — the same effect a 3-finger swipe already
 has. Omari rebinds `SUPER+arrows` to that command while the mode is on.
+
+Workspaces are this mode's vertical axis — the 3-finger vertical swipe
+switches them, the overview stacks them as rows scrolling down, and Omari
+turns the `workspaces` animation back on so the switch slides along that
+same axis. `SUPER+PageDown`/`SUPER+PageUp` are the keyboard version of it:
+Down to the next workspace, Up to the previous, dispatching the same
+`e+1`/`e-1` as Omarchy's own `SUPER+TAB`, which keeps working alongside
+them. Both bindings appear and disappear with the mode.
 
 A bar icon opens a popup explaining the mode with two independent toggles —
 one for the scrolling-layout mode, one for the overview — styled with
@@ -344,6 +352,13 @@ rm -rf ~/.config/omarchy/plugins/bergdahlchi.omari
   directly, so a plugin directory that arrived without its executable bits
   still works. A failure now surfaces in the popup instead of the switch
   silently flipping back.
+- `omari-mode.lua` binds `SUPER+PageDown`/`SUPER+PageUp` to
+  `hl.dsp.focus({ workspace = "e+1"/"e-1" })`. `e+1`/`e-1` rather than
+  `+1`/`-1` walks only the workspaces that exist, plus one empty one at the
+  end, instead of running off into empty workspace 11, 12, 13. Both are
+  unbound in Omarchy's defaults, so nothing has to be unbound first. `SUPER`
+  is not optional here: a bare `Page_Down` would be grabbed
+  compositor-wide and stop paging in every editor, browser and terminal.
 - `omari-overview.lua` binds both a 4-finger swipe up and `SUPER+ALT+O` to
   `omarchy-shell shell toggle bergdahlchi.omari`. Because the manifest
   declares an `overlay` entry point (`OmariOverview.qml`) alongside the

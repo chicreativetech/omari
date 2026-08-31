@@ -9,9 +9,9 @@ import qs.Ui
 // explains what the mode does and carries two independent on/off switches:
 // the scrolling-layout mode, and the niri-style overview. The scrolling mode
 // is hypr/omari-mode.lua (Hyprland's scrolling layout + 3-finger swipe +
-// column-aware SUPER+arrows); the overview's gesture is hypr/omari-overview.lua
-// (4-finger swipe up) and its screen is OmariOverview.qml, this plugin's
-// "overlay" entry point.
+// column-aware SUPER+arrows + SUPER+PageDown/PageUp workspace switching);
+// the overview's gesture is hypr/omari-overview.lua (4-finger swipe up) and
+// its screen is OmariOverview.qml, this plugin's "overlay" entry point.
 //
 // Both lua files ship inside this plugin directory, and each switch runs
 // bin/omari-toggle out of that same directory to copy one into
@@ -143,7 +143,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Omari enables niri-like scrollable tiling in Omarchy: windows scroll along a horizontal tape instead of stacking behind each other. A column can go full width without hiding your other apps behind it — scroll back to them with a three-finger swipe or SUPER+arrows, just like niri."
+          text: "Omari enables niri-like scrollable tiling in Omarchy: windows scroll along a horizontal tape instead of stacking behind each other. A column can go full width without hiding your other apps behind it — scroll back to them with a three-finger swipe or SUPER+arrows, just like niri. SUPER+PageDown/PageUp move between workspaces."
           wrapMode: Text.WordWrap
           color: root.dim
           font.family: root.fontFamily
