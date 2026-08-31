@@ -227,9 +227,11 @@ measured would otherwise stay on the books however long it was held. A gap
 wider than 50ms between the last movement and the release means the fingers had
 come to rest, and only the distance counts.
 
-Swiping *up* on an overview that is already up still dismisses it on release,
-as it always did: it is the way out that changes nothing, leaving you on the
-workspace you opened from rather than the one you scrolled to.
+Swiping *up* on an overview that is already open does nothing at all, for its
+whole length. Up is the way in and down is the way out; letting one stroke mean
+both puts the two halves of the gesture on the same side, so over-shooting the
+opening swipe and easing back reads as asking to leave. Escape and a background
+click still dismiss without going anywhere.
 
 ## The closing swipe
 

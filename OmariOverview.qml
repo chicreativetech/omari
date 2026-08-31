@@ -937,7 +937,8 @@ Item {
         // simply appears whole, which is what this fallback has always meant.
         // The mode is dropped here rather than left to the fingers lifting,
         // because a swipe still thought to be in flight would be read as a
-        // dismissal when it ended and close the overview it had just opened.
+        // gesture still in flight when it ended, and let its last events go on
+        // writing zoomProgress on an overview that had already given up on it.
         root.gestureMode = ""
         root.clearZoom()
       }
@@ -1065,11 +1066,14 @@ Item {
 
   // What the swipe currently in flight means:
   //
-  //   ""        nothing owns the overview
-  //   "open"    a swipe up is driving the zoom out of the desktop
-  //   "dismiss" a swipe up arrived on an overview already up
-  //   "dive"    a swipe down is driving the zoom into the centred window
-  //   "leave"   a swipe down that found nothing to dive into
+  //   ""       nothing owns the overview
+  //   "open"   a swipe up is driving the zoom out of the desktop
+  //   "dive"   a swipe down is driving the zoom into the centred window
+  //   "leave"  a swipe down that found nothing to dive into
+  //
+  // A swipe up that arrives on an overview already open sets nothing at all
+  // and is ignored for its whole length: up is the way in, down is the way
+  // out, and neither doubles as the other.
   //
   // Decided when the swipe starts and never re-read: a gesture that begins as
   // a dismissal stays one however far the fingers then wander, which is what
@@ -1124,7 +1128,13 @@ Item {
     // a fade owns the surface itself. Neither wants a second writer, and a
     // swipe arriving on one is a swipe at nothing in particular.
     if (root.leaving || root.pendingActivation) return
-    if (root.opened) { root.gestureMode = "dismiss"; return }
+    // Up is the way *in*, and only that. Swiping further up on an overview
+    // already open used to dismiss it, which made the same stroke mean
+    // "open" and "close" depending on a state you cannot see from your
+    // fingers — and put the two halves of the gesture on the same side, so
+    // reversing an over-shot swipe read as asking to leave. Down is the way
+    // out now, and it is the only way out; see gestureDiveBegin.
+    if (root.opened) return
 
     root.gestureMode = "open"
     root.gestureVelocity = 0
@@ -1163,18 +1173,8 @@ Item {
     // event that cleared a dive halfway through would leave the compositor
     // switched, the geometry frozen, and nothing holding the thread.
     var mode = root.gestureMode
-    if (mode !== "open" && mode !== "dismiss") return
-    root.gestureMode = ""
-
-    if (mode === "dismiss") {
-      // Up, on an overview already up, is still the way out that changes
-      // nothing: it leaves you on the workspace you opened from rather than
-      // the one you scrolled to. Swiping *down* is the one that lands you on
-      // what you are looking at; see gestureDiveBegin.
-      if (!cancelled) root.close()
-      return
-    }
     if (mode !== "open") return
+    root.gestureMode = ""
 
     var resting = root.gestureLastTime > 0 && timeMs > 0
       && (timeMs - root.gestureLastTime) > root.gestureIdleMs

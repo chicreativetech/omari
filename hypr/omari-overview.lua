@@ -84,9 +84,11 @@ end
 -- back down and cancelled, and a half-completed dive pushed back up, without
 -- ever lifting.
 --
--- Up opens the overview, or dismisses one already up. Down dives into whatever
--- the overview is centred on -- which is a workspace switch as well as a zoom,
--- and the far end has rather more to arrange for it; see gestureDiveBegin.
+-- Up opens the overview and nothing else: swiping further up on one already
+-- open is ignored, so the same stroke never means both "in" and "out". Down
+-- dives into whatever the overview is centred on -- which is a workspace
+-- switch as well as a zoom, and the far end has rather more to arrange for
+-- it; see gestureDiveBegin.
 hl.gesture({ fingers = 4, direction = "up", action = tracker("omari:overview", -1) })
 hl.gesture({ fingers = 4, direction = "down", action = tracker("omari:overview-down", 1) })
 
