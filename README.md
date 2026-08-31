@@ -232,10 +232,10 @@ around:
 - **Two fingers** drag the rows freely up/down, and on release the row nearest
   the centre snaps to it — carrying a flick's remaining speed into the choice,
   so a nudge moves one row and a firm swipe crosses several. Vertically the
-  fingers drag the *stack of workspaces* rather than the view over it, so
-  pushing up brings the row below into the centre — deliberately the opposite
-  sense to the mouse wheel below, which is the split most people already run
-  between a touchpad set to natural scrolling and a wheel that is not.
+  fingers drag the *view over the stack of workspaces* rather than the stack
+  itself, so pushing up brings the row above into the centre — the same sense
+  as the horizontal drag and the mouse wheel below, so nothing in the overview
+  reverses direction depending on which way you happen to be swiping.
   Left/right scrolls a row's windows freely, since windows are different widths
   and a swipe across a row should be able to stop wherever it likes.
 - **The mouse wheel** steps one row per notch vertically (fractions of a notch

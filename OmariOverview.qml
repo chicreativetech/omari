@@ -2090,13 +2090,13 @@ Item {
               gestureIdle.stop()
               vScroll.endDrag()
             } else {
-              // Not negated, unlike every other axis here: two fingers drag
-              // the *stack of workspaces* rather than the view over it, so
-              // pushing up brings the row below into the centre. The mouse
-              // wheel above keeps the opposite, conventional sense — which is
-              // the same split most people already run between a touchpad set
-              // to natural scrolling and a wheel that is not.
-              vScroll.dragBy(wheel.pixelDelta.y)
+              // Negated, like every other axis here: two fingers drag the
+              // *view over the stack of workspaces* rather than the stack
+              // itself, so pushing up brings the row above into the centre.
+              // Same sense as the horizontal drag beside it and the mouse
+              // wheel above, so nothing in the overview reverses direction
+              // depending on which way you happen to be swiping.
+              vScroll.dragBy(-wheel.pixelDelta.y)
             }
             wheel.accepted = true
           }
