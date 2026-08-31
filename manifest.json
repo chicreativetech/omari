@@ -5,7 +5,7 @@
   "version": "1.3.0",
   "author": "bergdahlchi",
   "license": "MIT",
-  "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, column-aware focus, SUPER+PageDown/PageUp workspace switching) plus a niri-style overview opened with a 4-finger swipe up.",
+  "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, column-aware focus, SUPER+PageDown/PageUp workspace switching) plus a niri-style overview on a stageless 4-finger swipe -- up to zoom out into it, down to zoom into what you are looking at.",
   "keepLoaded": true,
   "kinds": [
     "bar-widget",

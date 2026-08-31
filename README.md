@@ -4,9 +4,10 @@ A plugin for Omarchy that adds Niri-like functionality: an Omarchy shell
 bar plugin that toggles Hyprland's native `scrolling` layout, a 3-finger
 horizontal swipe, column-aware `SUPER+arrows` focus that doesn't disappear
 behind a maximized column, and `SUPER+PageDown`/`SUPER+PageUp` workspace
-switching — plus a niri-style overview, opened with a stageless 4-finger swipe
-up (the zoom tracks your fingers and reverses if you push back down) or
-`SUPER+ALT+O`, showing every workspace as a row of live window thumbnails.
+switching — plus a niri-style overview on a stageless 4-finger swipe: up to
+zoom out into it, down to zoom into whatever you are looking at, both tracking
+your fingers and reversible mid-swipe. `SUPER+ALT+O` opens it from the keyboard.
+Every workspace is a row of live window thumbnails.
 
 ## What it does
 
@@ -226,11 +227,51 @@ measured would otherwise stay on the books however long it was held. A gap
 wider than 50ms between the last movement and the release means the fingers had
 come to rest, and only the distance counts.
 
-A swipe arriving on an overview that is *already* up dismisses it, on release,
-as it always did. That direction is deliberately not tracked 1:1: leaving is a
-dive into whichever window the overview is centred on, and where that window is
-about to be is not known until the focus dispatch has landed. The swipe is a
-decision; the dive answers it.
+Swiping *up* on an overview that is already up still dismisses it on release,
+as it always did: it is the way out that changes nothing, leaving you on the
+workspace you opened from rather than the one you scrolled to.
+
+## The closing swipe
+
+Swiping **down** is the opening swipe's mirror in feel and nothing like it
+underneath, because leaving is not only a zoom. It lands you on the workspace
+you are *looking at*, so it is a workspace switch as well — and a switch moves
+the very thing the zoom has to land on, since focusing a window in a scrolling
+layout scrolls its workspace to bring that column into view. The dive has to be
+aimed at where the window is *about to be*, and nothing knows that until the
+focus dispatch has landed. That is why the click path takes a round trip through
+Hyprland rather than measuring what is on screen, and the gesture needs the same
+answer.
+
+So the gesture front-loads everything the click does at its click: freeze,
+capture, hand the keyboard grab back, dispatch, ask where the window went. That
+is roughly **100ms**, most of it waiting for Hyprland to finish restoring focus
+after the grab goes back, and for that beat the fingers move and the zoom does
+not. The alternative — aiming at where the window is now and correcting when the
+answer arrives — puts a jerk in the middle of the one transition that has to be
+seamless. Standing still under an opaque backdrop is the cheaper place to spend
+it. The travel origin is taken when the answer lands, so the wait costs a beat
+rather than a jump. From there the fingers drive exactly the ramp `beginDive`
+would have run.
+
+Unlike the opening swipe, this one has something to undo if it is abandoned: the
+workspace has really been switched by the time you change your mind. Cancelling
+ramps back to the overview and dispatches the focus back, which is why the
+window to return to is captured before anything is sent. Released inside the
+arranging beat, before there is any aim to ramp from, it degrades to exactly
+what a click does — the round trip finishes and animates the dive itself.
+
+Three things do not have a window to dive into: the empty row, a thumbnail that
+cannot be measured, and an overview that is not open. The first two hold still
+and switch plainly on release, down the same fallback chain a click takes. The
+third does nothing at all, so a 4-finger swipe down on the bare desktop stays
+free.
+
+The gesture is registered as its own `down`, not as a shared `vertical`, so each
+direction keeps its own travel and its own meaning. Hyprland allows the pair:
+`addGesture` only refuses a registration whose axis collides with an existing one
+for the same finger count, and `UP` and `DOWN` collide with neither each other
+nor `VERTICAL`.
 
 ## Opening cost
 

@@ -136,6 +136,9 @@ Item {
     // go on writing zoomProgress on a closed overview, and the release would
     // ramp it back open.
     root.gestureMode = ""
+    root.gestureAimed = false
+    root.gestureTravelOrigin = 0
+    root.gestureRestoreArg = ""
     geometryRefresh.stop()
     root.clearZoom()
     root.thawGeometry()
@@ -793,6 +796,10 @@ Item {
     root.dbg("aimed shift=" + root.diveShiftPx.toFixed(1)
       + " real=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY) + ")"
       + " scale=" + root.zoomScale.toFixed(3))
+    // A swipe still on the pad takes the ramp itself; this is the moment it has
+    // been waiting for and the only thing it was waiting for. A swipe already
+    // released, or a click, falls through and is animated as it always was.
+    if (root.gestureDiving) { root.gestureDiveAimed(); return }
     zoomRamp.run(0, 1, root.diveMs, root.finishActivation)
   }
 
@@ -1056,13 +1063,20 @@ Item {
   // to wait for a layer surface to be mapped is a swipe that does nothing for
   // a third of a second and then jumps.
 
-  // "" when no swipe owns the overview, "open" while one is driving
-  // zoomProgress, "dismiss" for one that arrived on an overview already up.
+  // What the swipe currently in flight means:
+  //
+  //   ""        nothing owns the overview
+  //   "open"    a swipe up is driving the zoom out of the desktop
+  //   "dismiss" a swipe up arrived on an overview already up
+  //   "dive"    a swipe down is driving the zoom into the centred window
+  //   "leave"   a swipe down that found nothing to dive into
+  //
   // Decided when the swipe starts and never re-read: a gesture that begins as
   // a dismissal stays one however far the fingers then wander, which is what
   // stops a wobble halfway through from changing what letting go will mean.
   property string gestureMode: ""
   readonly property bool gestureActive: root.gestureMode === "open"
+  readonly property bool gestureDiving: root.gestureMode === "dive"
 
   // Finger travel for a full zoom out. A fraction of the screen rather than a
   // pixel count, for the same reason rowHeight is one: the gesture should ask
@@ -1086,6 +1100,19 @@ Item {
   // *started* as, and would open an overview the fingers had plainly decided
   // against.
   readonly property int gestureIdleMs: 50
+
+  // Whether the dive gesture has been told where it is going yet, and the
+  // travel reading at the moment it was. See gestureDiveBegin: the fingers
+  // move for something like a tenth of a second before the zoom may follow
+  // them, and measuring from here rather than from the start of the swipe is
+  // what keeps that beat from becoming a jump.
+  property bool gestureAimed: false
+  property real gestureTravelOrigin: 0
+
+  // How to put the focus back if a dive gesture is abandoned. Captured before
+  // anything is dispatched, because by the time it is wanted the compositor
+  // has already been moved.
+  property string gestureRestoreArg: ""
 
   property real gestureVelocity: 0
   property real gestureLastTravel: 0
@@ -1131,15 +1158,19 @@ Item {
   }
 
   function gestureFinish(cancelled, timeMs) {
+    // Only ever clears a mode this handler owns. Hyprland runs one gesture at a
+    // time, so the two directions cannot genuinely overlap — but a stray end
+    // event that cleared a dive halfway through would leave the compositor
+    // switched, the geometry frozen, and nothing holding the thread.
     var mode = root.gestureMode
+    if (mode !== "open" && mode !== "dismiss") return
     root.gestureMode = ""
 
     if (mode === "dismiss") {
-      // What a 4-finger swipe has always done to an overview that is already
-      // up. Deliberately *not* tracked 1:1 on the way out: leaving is a dive
-      // into whichever window the overview is centred on, and where that
-      // window is about to be is not known until the focus dispatch has landed
-      // (see aimZoom). The swipe is a decision; the dive answers it.
+      // Up, on an overview already up, is still the way out that changes
+      // nothing: it leaves you on the workspace you opened from rather than
+      // the one you scrolled to. Swiping *down* is the one that lands you on
+      // what you are looking at; see gestureDiveBegin.
       if (!cancelled) root.close()
       return
     }
@@ -1173,6 +1204,223 @@ Item {
     }
   }
 
+  // ---- the closing swipe ----
+  //
+  // Swiping down is the opening swipe's mirror in feel and nothing like it in
+  // machinery, because leaving is not only a zoom. It lands you on the
+  // workspace you are *looking at*, so it is a workspace switch as well, and a
+  // switch moves the very thing the zoom has to land on: focusing a window in a
+  // scrolling layout scrolls its workspace to bring that column into view. The
+  // dive therefore has to be aimed at where the window is about to be, and
+  // nothing knows that until the focus dispatch has landed — see aimZoom, which
+  // is the whole reason the click path takes a round trip through Hyprland
+  // rather than measuring what is on screen.
+  //
+  // So this gesture front-loads the arrangement the click does at its click:
+  // freeze, capture, hand the keyboard grab back, dispatch, ask where the
+  // window went. All of that is ~100ms, most of it waiting for Hyprland to
+  // finish restoring focus after the grab goes back (see pendingDispatch), and
+  // for that ~100ms the fingers move and the zoom does not. The alternative is
+  // aiming at where the window is *now* and correcting when the answer comes
+  // back, which is a jerk in the middle of the one transition that has to be
+  // seamless. Standing still under an opaque backdrop is the cheaper place to
+  // spend it, and the travel origin is taken when the answer lands so that the
+  // wait costs a beat rather than a jump.
+  //
+  // What the fingers then drive is exactly the ramp beginDive would have run.
+  //
+  // Unlike the opening swipe, this one has something to undo if it is
+  // abandoned: the workspace has really been switched by then. Cancelling
+  // ramps back to the overview and dispatches the focus back, which is why the
+  // window to return to is captured before anything is sent.
+  function gestureDiveBegin() {
+    if (root.gestureMode !== "") return
+    if (!root.opened || root.leaving || root.pendingActivation) return
+
+    // A ramp still running from the swipe that opened this would be a second
+    // writer on zoomProgress. Rare enough to want no ceremony -- it takes
+    // starting a downward swipe inside the ~260ms tail of an upward one -- and
+    // the dive is measured from the overview, so it starts from there.
+    zoomRamp.halt()
+    root.zoomProgress = 0
+
+    var row = root.workspaceRows[root.selectedRow]
+    var apps = root.selectedToplevels
+    var index = Math.max(0, Math.min(apps.length - 1, root.selectedApp))
+    var toplevel = apps.length > 0 ? apps[index] : null
+    var arg = root.isEmptyRowModel(row)
+      ? (row ? "hl.dsp.focus({ workspace = '" + row.id + "' })" : "")
+      : root.focusArg(toplevel)
+
+    if (!arg) return
+
+    // The empty row is a workspace with nothing on it, so there is no window to
+    // dive into and nothing for the fingers to drive. It still switches — it
+    // just decides on release, the way it does from a click.
+    if (root.isEmptyRowModel(row) || !toplevel) {
+      root.gestureMode = "leave"
+      return
+    }
+
+    root.freezeGeometry()
+    if (!root.captureZoom(root.selectedRow, index)) {
+      // Nothing measurable to zoom, which is the same position the click path
+      // finds itself in and answers the same way: switch on release, plainly.
+      root.thawGeometry()
+      root.gestureMode = "leave"
+      return
+    }
+
+    root.gestureMode = "dive"
+    root.gestureAimed = false
+    root.gestureTravelOrigin = 0
+    root.gestureVelocity = 0
+    root.gestureLastTravel = 0
+    root.gestureLastTime = 0
+    root.gestureRestoreArg = root.focusArg(Hyprland.activeToplevel)
+    root.dbgClickMs = Date.now()
+
+    root.pendingActivation = toplevel
+    root.aimRetries = 0
+    root.diveRow = root.selectedRow
+    root.diveApp = index
+    root.awaitingLanding = true
+
+    // Deliberately not beginHandOff. That raises `leaving` and drops `opened`,
+    // which is right for a click -- a click has already decided -- and wrong
+    // for a gesture that may still be pushed back up. The overview is still
+    // open until the fingers say otherwise, and the surface no longer needs
+    // `leaving` to keep it mapped. Only the grab goes, because only the grab
+    // stands between the dispatch and its landing.
+    root.grabsKeyboard = false
+    root.pendingDispatch = arg
+    restoreFallback.restart()
+    diveDeadline.restart()
+  }
+
+  function gestureDiveAt(travel, timeMs) {
+    if (root.gestureMode !== "dive") return
+    if (root.gestureLastTime > 0 && timeMs > root.gestureLastTime) {
+      root.gestureVelocity = 0.5 * root.gestureVelocity
+        + 0.5 * (travel - root.gestureLastTravel) / (timeMs - root.gestureLastTime)
+    }
+    root.gestureLastTravel = travel
+    root.gestureLastTime = timeMs
+    // Still arranging the dive. The travel keeps being read, so the speed at
+    // the release is honest, but the zoom does not move until it knows where
+    // it is going.
+    if (!root.gestureAimed) return
+    root.zoomProgress = Math.max(0, Math.min(1,
+      (travel - root.gestureTravelOrigin) / root.gestureDistance))
+  }
+
+  // Hyprland has answered with the layout the dispatch produced and aimZoom has
+  // pointed the dive at it. From here the fingers own the ramp.
+  function gestureDiveAimed() {
+    root.gestureAimed = true
+    root.gestureTravelOrigin = root.gestureLastTravel
+    root.dbg("dive gesture aimed after "
+      + Math.round(Date.now() - root.dbgClickMs) + "ms, origin "
+      + Math.round(root.gestureTravelOrigin) + "px")
+  }
+
+  function gestureDiveFinish(cancelled, timeMs) {
+    // Its own modes only; see gestureFinish.
+    var mode = root.gestureMode
+    if (mode !== "dive" && mode !== "leave") return
+    root.gestureMode = ""
+
+    if (mode === "leave") {
+      // Nothing was arranged, so nothing has to be undone and nothing was
+      // stored: activateSelection recomputes the target and walks the same
+      // fallback chain a click does, ending at a plain hand-off.
+      if (!cancelled) root.activateSelection()
+      return
+    }
+
+    var resting = root.gestureLastTime > 0 && timeMs > 0
+      && (timeMs - root.gestureLastTime) > root.gestureIdleMs
+    var speed = resting ? 0 : root.gestureVelocity
+    var commit = !cancelled
+      && (root.zoomProgress >= root.gestureCommitRatio
+        || speed >= root.gestureFlickSpeed)
+
+    if (!root.gestureAimed) {
+      // Released inside the arranging beat. There is no ramp to finish because
+      // there is no aim yet, so hand it back to the machinery that was already
+      // going to do this: clearing the mode above is what lets beginDive run
+      // its own ramp when the answer arrives, exactly as it does for a click.
+      if (commit) {
+        // `leaving` first, then `opened` -- see panel.visible.
+        root.leaving = true
+        root.opened = false
+        return
+      }
+      root.gestureDiveRestore()
+      return
+    }
+
+    if (commit) {
+      root.leaving = true
+      root.opened = false
+      zoomRamp.run(root.zoomProgress, 1,
+        Math.round(root.diveMs * Math.max(0.15, 1 - root.zoomProgress)),
+        root.finishActivation)
+      return
+    }
+
+    zoomRamp.run(root.zoomProgress, 0,
+      Math.round(root.diveMs * Math.max(0.15, root.zoomProgress)),
+      root.gestureDiveRestore)
+  }
+
+  // Putting back everything gestureDiveBegin moved. The zoom is already home
+  // by the time this runs; what is left is the compositor, which has really
+  // switched workspace behind the backdrop and has to be switched back.
+  function gestureDiveRestore() {
+    var back = root.gestureRestoreArg
+    root.gestureRestoreArg = ""
+    root.gestureAimed = false
+    root.gestureTravelOrigin = 0
+
+    // Before hyprSend, and not only for tidiness: the socket's reply lands in
+    // beginDive, and `awaitingLanding` is the flag that makes it ignore one it
+    // was not waiting for.
+    root.awaitingLanding = false
+    diveDeadline.stop()
+    aimRetry.stop()
+    root.pendingActivation = null
+    root.diveRow = -1
+    root.diveApp = -1
+    root.diveShiftPx = 0
+    root.zoomProgress = 0
+    root.zoomScale = 1
+    root.zoomThumbX = 0
+    root.zoomThumbY = 0
+    root.zoomRealX = 0
+    root.zoomRealY = 0
+    root.thawGeometry()
+
+    if (root.pendingDispatch !== "") {
+      // Abandoned before the dispatch ever went out — Hyprland was still
+      // restoring focus from the grab going back. Nothing switched, so there is
+      // nothing to switch back, and the restore still in flight is aimed at the
+      // window this would have asked for anyway.
+      root.pendingDispatch = ""
+      restoreFallback.stop()
+    } else if (back !== "") {
+      root.hyprSend("dispatch " + back)
+    }
+
+    // Last, and after the dispatch rather than before it. Taking the grab does
+    // not schedule a focus restore the way giving it back does — that hazard
+    // runs the other way (see pendingDispatch) — but the dispatch above is the
+    // statement that has to be the last word about where focus ends up, and
+    // sending it into a surface that has just re-asserted exclusive focus is
+    // the one ordering nobody has to reason about.
+    root.grabsKeyboard = true
+  }
+
   // Deliberately not gated on `opened`, unlike the geometry listener above:
   // the first event of a swipe arrives while the overview is still down, and
   // that is the entire point of it.
@@ -1195,6 +1443,15 @@ Item {
         break
       case "omari:overview-end":
         root.gestureFinish(parts[1] === "1", Number(parts[2]))
+        break
+      case "omari:overview-down-begin":
+        root.gestureDiveBegin()
+        break
+      case "omari:overview-down-at":
+        root.gestureDiveAt(Number(parts[1]), Number(parts[2]))
+        break
+      case "omari:overview-down-end":
+        root.gestureDiveFinish(parts[1] === "1", Number(parts[2]))
         break
       }
     }

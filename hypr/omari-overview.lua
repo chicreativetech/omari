@@ -12,7 +12,7 @@
 -- hyprland.lua) already sources on every reload -- see
 -- /usr/share/omarchy/default/hypr/toggles.lua.
 
--- The swipe does not *trigger* the opening zoom, it *is* the opening zoom.
+-- The swipe does not *trigger* the zoom, it *is* the zoom, in both directions.
 --
 -- hl.gesture takes a table of start/update/finish callbacks as its action
 -- (Hyprland 0.56, src/config/lua/bindings/LuaBindingsConfigRules.cpp) and
@@ -24,8 +24,7 @@
 -- Each callback gets the event as a table -- `delta` is the *per-event*
 -- delta, not the running total (ITrackpadGesture::distance does the
 -- accumulating for Hyprland's built-in gestures; a Lua one has to do its
--- own), and `time_ms` is the event's own timestamp. Upward finger motion is
--- negative y, so travel is accumulated by subtracting it.
+-- own), and `time_ms` is the event's own timestamp.
 --
 -- What goes out is hl.dsp.event, which puts a single `custom>>...` line on
 -- Hyprland's event socket -- the socket the overlay is already listening to.
@@ -35,30 +34,26 @@
 -- Only the raw travel is sent. Turning pixels into a fraction of a zoom
 -- wants the height of the screen and the state of the overview, and both of
 -- those live at the other end.
-local travel = 0
-
 local function emit(msg)
   hl.dispatch(hl.dsp.event(msg))
 end
 
-local function report(e)
-  travel = travel - e.delta.y
-  emit(string.format("omari:overview-at %.1f %d", travel, e.time_ms))
-end
+-- Both directions report the same three things about themselves and differ
+-- only in which way counts as forward, so they are the same tracker twice.
+-- `sign` turns the axis into travel that grows as the gesture proceeds: up is
+-- negative y, down is positive.
+local function tracker(prefix, sign)
+  local travel = 0
 
--- Registered as "up", not "vertical", so a downward 4-finger swipe still
--- matches nothing and does nothing, exactly as before. It does not stop a
--- swipe being *reversed*: CTrackpadGestures::gestureUpdate picks the matching
--- gesture once, on the first 5px of travel, and keeps feeding this one every
--- event afterwards whichever way the fingers then go -- which is what lets a
--- half-opened overview be pushed back down and cancelled without lifting.
-hl.gesture({
-  fingers = 4,
-  direction = "up",
-  action = {
+  local function report(e)
+    travel = travel + sign * e.delta.y
+    emit(string.format("%s-at %.1f %d", prefix, travel, e.time_ms))
+  end
+
+  return {
     start = function(e)
       travel = 0
-      emit("omari:overview-begin")
+      emit(prefix .. "-begin")
       report(e)
     end,
     update = report,
@@ -71,11 +66,29 @@ hl.gesture({
       -- the gap between the last one and this is the only way to tell a swipe
       -- still travelling at the release from one that came to rest on the pad
       -- first and then let go.
-      emit(string.format("omari:overview-end %d %d", e.cancelled and 1 or 0, e.time_ms))
+      emit(string.format("%s-end %d %d", prefix, e.cancelled and 1 or 0, e.time_ms))
       travel = 0
     end,
-  },
-})
+  }
+end
+
+-- Two gestures rather than one "vertical", so each direction keeps its own
+-- travel and its own meaning. Hyprland allows the pair: addGesture only
+-- refuses a registration whose axis collides with an existing one for the same
+-- finger count, and UP and DOWN collide with neither each other nor VERTICAL.
+--
+-- Registering them separately does not stop either being *reversed* mid-swipe:
+-- CTrackpadGestures::gestureUpdate picks the matching gesture once, on the
+-- first 5px of travel, and keeps feeding that one every event afterwards
+-- whichever way the fingers then go. So a half-opened overview can be pushed
+-- back down and cancelled, and a half-completed dive pushed back up, without
+-- ever lifting.
+--
+-- Up opens the overview, or dismisses one already up. Down dives into whatever
+-- the overview is centred on -- which is a workspace switch as well as a zoom,
+-- and the far end has rather more to arrange for it; see gestureDiveBegin.
+hl.gesture({ fingers = 4, direction = "up", action = tracker("omari:overview", -1) })
+hl.gesture({ fingers = 4, direction = "down", action = tracker("omari:overview-down", 1) })
 
 -- Keyboard equivalent of the swipe, for when your hands are on the keys.
 -- Not SUPER+CTRL+O: Omarchy already binds that to "Toggle menu". SUPER+O,
