@@ -229,7 +229,14 @@ Item {
   // well inside the first frames of the surface being mapped --
   // and every rectangle in here is a binding over lastIpcObject, so the rows
   // lay themselves out again the moment it arrives.
-  function refreshGeometry() { Hyprland.refreshToplevels() }
+  //
+  // Monitors along with them, and not as an afterthought: the surface's own
+  // corner is read off the monitor's reserved area (see surfaceLeft), so a
+  // stale monitor is a dive aimed at where the bar used to be.
+  function refreshGeometry() {
+    Hyprland.refreshToplevels()
+    Hyprland.refreshMonitors()
+  }
 
   // Events that can move or resize a window, and so invalidate the geometry
   // the rows are drawn from. Deliberately a list rather than "any event": a
@@ -482,6 +489,32 @@ Item {
   property bool zoomReady: true
   property var pendingActivation: null
 
+  // Where the overlay's own top-left sits on the monitor, which since the
+  // surface started respecting exclusion zones is no longer the monitor's
+  // top-left: the compositor hands back the monitor less whatever the bar and
+  // anything beside it have reserved, and the overlay begins at the corner of
+  // what is left. Every real-window rectangle in here is in layout
+  // coordinates, so it has to come off them before they mean anything as a
+  // position inside this surface -- see zoomRealX/Y, which are the only two
+  // measurements in the file that cross that line. Get it wrong and every
+  // dive lands the height of the bar out of place, which is the one frame in
+  // the whole interaction where being out of place is visible.
+  //
+  // Read from Hyprland's own reserved area rather than measured off the
+  // surface, because a size can't be told apart from a position: a surface
+  // shortened by 26px looks the same whether the bar is at the top or the
+  // bottom. `reserved` is [left, top, right, bottom] in logical pixels -- the
+  // same units as a window's `at` -- and is the very quantity the compositor
+  // subtracted to place this surface, so the two cannot drift.
+  readonly property var panelReserved: {
+    var mon = panel.screen ? Hyprland.monitorFor(panel.screen) : null
+    var ipc = mon ? mon.lastIpcObject : undefined
+    var r = ipc ? ipc.reserved : undefined
+    return (r && r.length === 4) ? r : [0, 0, 0, 0]
+  }
+  readonly property real surfaceLeft: Number(root.panelReserved[0]) || 0
+  readonly property real surfaceTop: Number(root.panelReserved[1]) || 0
+
   // Which thumbnail the in-flight dive is aimed at. Kept so aimZoom can find
   // it again once Hyprland has answered, without the click having to be
   // replayed.
@@ -617,10 +650,12 @@ Item {
     var p = item.mapToItem(zoomLayer, 0, 0)
     root.zoomThumbX = p.x
     root.zoomThumbY = p.y
-    // The overlay covers the monitor, so a window's place on screen is just
-    // its layout rectangle less the monitor's own origin.
-    root.zoomRealX = r.x - row.monX
-    root.zoomRealY = r.y - row.monY
+    // A window's place inside this surface is its layout rectangle less the
+    // monitor's origin and less the corner the surface actually starts at --
+    // see surfaceLeft/surfaceTop. The overlay used to cover the monitor
+    // exactly, and then the second term was zero and went unwritten.
+    root.zoomRealX = r.x - row.monX - root.surfaceLeft
+    root.zoomRealY = r.y - row.monY - root.surfaceTop
     root.zoomScale = r.w / item.width
     return true
   }
@@ -937,8 +972,9 @@ Item {
     // zero and the strip is untouched, so nothing moves under the capture.
     root.zoomThumbX -= root.diveShiftPx
 
-    root.zoomRealX = r.x - row.monX
-    root.zoomRealY = r.y - row.monY
+    // Same crossing as captureZoom's, and for the same reason.
+    root.zoomRealX = r.x - row.monX - root.surfaceLeft
+    root.zoomRealY = r.y - row.monY - root.surfaceTop
     root.zoomScale = r.w / item.width
   }
 
@@ -2079,16 +2115,39 @@ Item {
     WlrLayershell.keyboardFocus: (root.surfaceLive && root.grabsKeyboard)
       ? WlrKeyboardFocus.Exclusive
       : WlrKeyboardFocus.None
-    exclusionMode: ExclusionMode.Ignore
+    // Was Ignore, and Ignore is what put the overview over the bar. The two
+    // modes are not a preference about exclusion zones, they are two different
+    // rectangles: Quickshell sends exclusive_zone -1 for Ignore and 0 for
+    // Normal, and Hyprland lays a -1 surface out against the whole monitor and
+    // a 0 one against what is left of it (arrangeLayerArray: `bounds =
+    // full_area` against `bounds = *usableArea`). So this one line is the
+    // whole of showing the bar. Nothing here draws around it, punches a hole
+    // in an input region, or has to know how tall it is -- the surface simply
+    // is not there any more, and the bar is as visible and as clickable
+    // underneath the overview as it is with the overview down.
+    //
+    // Reserves nothing itself: Normal is "respect the others and optionally
+    // set one", and exclusiveZone defaults to 0, which is the "not one" half.
+    // An overview that reserved space would be reserving it from the windows
+    // it is a picture of.
+    exclusionMode: ExclusionMode.Normal
 
     // Nothing at all is clickable while the overview is down. The surface
-    // covers the screen the whole time it is up, which is now all of the time,
+    // covers the usable screen the whole time it is up, which is now all of
+    // the time,
     // so without this the desktop under it would stop taking clicks the moment
     // the shell started. An empty region is the documented way to ask for that:
     // Quickshell sets Qt::WindowTransparentForInput for a mask that is present
     // but empty, and treats a null mask as "the whole window".
     property Region noInput: Region {}
     mask: root.surfaceLive ? null : panel.noInput
+    // The compositor resizing this surface is the only notice that the
+    // reserved area changed -- hiding the bar is a layer-shell rearrange, not
+    // a Hyprland event, so there is nothing on the socket to listen for. The
+    // resize itself is the event: whatever moved, our corner moved with it.
+    onHeightChanged: Hyprland.refreshMonitors()
+    onWidthChanged: Hyprland.refreshMonitors()
+
     // Same workaround as the background layer (Background.qml): a
     // layer-shell surface that toggles visible has been observed to come
     // back showing its last committed frame instead of a fresh one. The
