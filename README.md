@@ -24,7 +24,12 @@ has. Omari rebinds `SUPER+arrows` to that command while the mode is on.
 Workspaces are this mode's vertical axis — the 3-finger vertical swipe
 switches them, the overview stacks them as rows scrolling down, and Omari
 turns the `workspaces` animation back on so the switch slides along that
-same axis. `SUPER+PageDown`/`SUPER+PageUp` are the keyboard version of it:
+same axis. That swipe is Omari's own — Omarchy ships all three of its
+3-finger gesture lines commented out in `hypr/input.lua`, and the only
+workspace one among them is horizontal, so nothing bound 3-finger vertical
+until `omari-mode.lua` did. It uses Hyprland's built-in `workspace` action,
+so the workspaces travel under your fingers and a half-swipe can be pushed
+back, rather than a threshold firing a switch once you let go. `SUPER+PageDown`/`SUPER+PageUp` are the keyboard version of it:
 Down to the next workspace, Up to the previous, dispatching the same
 `e+1`/`e-1` as Omarchy's own `SUPER+TAB`, which keeps working alongside
 them. Both bindings appear and disappear with the mode.

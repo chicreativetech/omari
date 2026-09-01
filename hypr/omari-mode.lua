@@ -26,21 +26,43 @@ hl.config({
 -- than in input.lua.
 hl.gesture({ fingers = 3, direction = "horizontal", action = "scroll_move" })
 
--- Vertical 3-finger swipes are NOT registered here. input.lua already owns
--- that gesture, and it loads before this file (hyprland.lua requires
--- hypr.input at line 20, default.hypr.toggles at line 26), so a second
--- registration is shadowed by the first and Hyprland warns about it:
---   "gesture will be overshadowed by a previous gesture.
---    previous VERTICAL shadows new VERTICAL"
--- The split is deliberate and input.lua says so from its side: vertical
--- switches workspaces whatever the layout, so it belongs in the always-on
--- config, while the horizontal swipe above only means anything while the
--- scrolling layout is active, so it belongs here.
+-- Vertical 3-finger swipe is the other half of the same tape: horizontal moves
+-- along a workspace, vertical moves between them.
+--
+-- It has to be registered, and this is the file to do it in. Omarchy does not
+-- ship the gesture, contrary to what this file used to claim: hypr/input.lua
+-- has three 3-finger lines, all three are commented out, and the only
+-- workspace one among them is HORIZONTAL. Nothing bound 3-finger VERTICAL, so
+-- swiping it did nothing at all -- while the README promised it switched
+-- workspaces.
+--
+-- The built-in "workspace" action rather than a Lua callback, so the swipe is
+-- the switch: CWorkspaceSwipeGesture drives Hyprland's unified workspace
+-- swipe, and the workspaces travel under the fingers and can be pushed back
+-- and abandoned, instead of a threshold firing a dispatch once the stroke is
+-- over. Same reason the overview's zoom is a gesture and not a trigger.
+--
+-- Registered VERTICAL, which the built-in handles on its own terms:
+-- ITrackpadGesture::distance takes delta.y for a VERTICAL registration, and
+-- gestures:workspace_swipe_invert (on, in Omarchy's defaults) is what makes
+-- fingers-up the *next* workspace -- the same direction Page Down goes below,
+-- and the same direction the overview stacks its rows.
+--
+-- This is the only 3-finger VERTICAL there can be. addGesture refuses a
+-- registration whose axis is already taken for the same finger count and mods
+-- -- UP, DOWN and VERTICAL all normalize to the VERTICAL axis
+-- (src/managers/input/trackpad/TrackpadGestures.cpp) -- so a second one in
+-- omari-overview.lua would be rejected outright whenever both toggles are on:
+--   "Gesture will be overshadowed by a previous gesture.
+--    Previous VERTICAL shadows new VERTICAL"
+-- The rejection surfaces as a config error rather than a crash, which is a
+-- quiet way to lose a gesture. The overview scrolls with two fingers.
+hl.gesture({ fingers = 3, direction = "vertical", action = "workspace" })
 
 -- Omarchy ships the "workspaces" animation leaf disabled (instant switch,
 -- no slide) since its default SUPER+number switching has no swipe direction
--- to match. Workspace switching here is a vertical swipe (input.lua's
--- gesture), so the switch should animate along that same axis -- same
+-- to match. Workspace switching here is the vertical swipe registered above,
+-- so the switch should animate along that same axis -- same
 -- style/speed/bezier Omarchy already uses for the (also
 -- vertical-swipe-driven) specialWorkspace animation.
 hl.animation({ leaf = "workspaces", enabled = true, speed = 3, bezier = "easeOutQuint", style = "slidevert" })
@@ -64,7 +86,7 @@ o.bind("SUPER + UP", "Focus on above window", hl.dsp.layout("focus u"))
 o.bind("SUPER + DOWN", "Focus on below window", hl.dsp.layout("focus d"))
 
 -- Workspaces are the vertical axis of this mode: the 3-finger vertical swipe
--- (input.lua) switches them, the overview stacks them as rows scrolling down,
+-- above switches them, the overview stacks them as rows scrolling down,
 -- and the animation above slides them vertically. Page Down/Up is the keyboard
 -- version of that same axis -- Down goes to the next workspace, Up to the
 -- previous, matching where the swipe and the overview put them.
