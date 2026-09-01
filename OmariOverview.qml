@@ -280,13 +280,6 @@ Item {
   // drawn at (see geomScale in the row delegate).
   readonly property real rowHeight: Math.max(Style.space(120), panel.height * 0.5)
 
-  // Screencopy capture resolution is deliberately NOT tied to rowHeight.
-  // Thumbnails capture live while their row is on screen, so requesting a
-  // proportionally larger buffer per thumbnail multiplies sustained
-  // GPU/compositor load a lot. A thumbnail this size doesn't need more source
-  // pixels than it always did — only the on-screen presentation got bigger.
-  readonly property real captureBaseHeight: Style.space(200)
-
   // Like rowHeight, a ratio: the gap between two workspaces reads relative to
   // how big a workspace is, not in absolute pixels.
   readonly property real rowSpacing: Math.round(root.rowHeight * 0.104)
@@ -2738,51 +2731,112 @@ Item {
                         : Util.alpha(Color.foreground, 0.4)
                       clip: true
 
-                      ScreencopyView {
-                        id: capture
-                        anchors.fill: parent
+                      // A thumbnail is a long way down from the window it
+                      // shows -- better than 2x on a 1080p panel, more than
+                      // that on anything bigger, measured in device pixels
+                      // rather than the layout's -- and ScreencopyView draws
+                      // its capture with plain bilinear filtering,
+                      // hardcoded, with no mipmaps. Past 2x
+                      // minification bilinear reads four of the sixteen
+                      // source texels each output pixel covers, so which part
+                      // of a glyph survives depends on exactly where the
+                      // thumbnail lands: text crawls and sparkles on every
+                      // sub-pixel move, and an overview that opens on a zoom
+                      // and scrolls kinetically in two axes is moving almost
+                      // all the time.
+                      //
+                      // So take the shrink away from the view. The layer
+                      // renders the capture offscreen at up to twice the
+                      // thumbnail's device size -- never past what the
+                      // capture itself has to give -- where bilinear is at or
+                      // near 1:1 and exact, mipmaps that buffer, and samples
+                      // the mipmap for the final step down. That last sample
+                      // is the box filter the shimmer was missing.
+                      //
+                      // It also costs less to scroll than it looks: a layer
+                      // re-renders when its contents change, not when it
+                      // moves, so a row sliding past redraws one cached
+                      // texture per thumbnail rather than the capture itself.
+                      Item {
+                        id: captureBox
                         // Without this inset the capture paints edge-to-edge
                         // over the border above -- hover was firing correctly
                         // (containsMouse, the click, the border binding all
                         // worked) but the video was visually covering the ring
                         // the whole time. Tracking border.width means an
                         // unringed thumbnail is pure window, edge to edge.
+                        anchors.fill: parent
                         anchors.margins: thumb.border.width
-                        captureSource: thumb.modelData.wayland
-                        // Live only while this row is at or near the
-                        // viewport. Every thumbnail is its own screencopy
-                        // stream against the compositor, so keeping all of
-                        // them running for rows scrolled far off-screen is
-                        // sustained GPU and Wayland buffer traffic
-                        // competing with the very frames a smooth scroll
-                        // needs. A row that goes off-screen keeps the last
-                        // frame it captured and resumes streaming before it
-                        // comes back into view.
-                        //
-                        // Deliberately still tied to nothing but the row's
-                        // position, right through the leave. Stopping the
-                        // streams the moment a dive starts looks like an
-                        // obvious saving -- they are about to be scaled off the
-                        // edge of the screen -- but it is a change of state at
-                        // the exact frame that has to be unremarkable, on the
-                        // one surface the eye is following.
-                        live: rowItem.nearViewport
-                        paintCursor: false
-                        constraintSize: Qt.size(
-                          Math.round(root.captureBaseHeight * 2.5 * Screen.devicePixelRatio),
-                          Math.round(root.captureBaseHeight * Screen.devicePixelRatio))
 
-                        // A row created off-screen has no last frame to
-                        // keep, so grab one still for it up front -- but only
-                        // while the overview is actually up. The plugin is
-                        // keepLoaded, so these delegates also exist, and are
-                        // rebuilt every time a window opens or closes, with
-                        // the overview closed and no recording context to
-                        // capture into: asking then is work that can only
-                        // fail, and it logged a warning per thumbnail for the
-                        // privilege.
-                        Component.onCompleted:
-                          if (root.opened && !capture.live) capture.captureFrame()
+                        // 1 for a thumbnail already at or above the capture's
+                        // own resolution: supersampling past the source buys
+                        // no detail, and the buffer is quadratic in this --
+                        // every live thumbnail keeps one -- which is what the
+                        // ceiling is for. At 2 a 4x shrink becomes a box
+                        // filter followed by a 2x bilinear step, which is
+                        // already most of the way to clean.
+                        readonly property real superSample: {
+                          var src = capture.sourceSize
+                          var devW = captureBox.width * Screen.devicePixelRatio
+                          if (!capture.hasContent || !(src.width > 0) || !(devW > 0)) return 1
+                          return Math.max(1, Math.min(2, src.width / devW))
+                        }
+
+                        layer.enabled: true
+                        layer.smooth: true
+                        layer.mipmap: true
+                        layer.textureSize: Qt.size(
+                          Math.max(1, Math.round(captureBox.width * Screen.devicePixelRatio * captureBox.superSample)),
+                          Math.max(1, Math.round(captureBox.height * Screen.devicePixelRatio * captureBox.superSample)))
+
+                        ScreencopyView {
+                          id: capture
+                          anchors.fill: parent
+                          captureSource: thumb.modelData.wayland
+                          // Live only while this row is at or near the
+                          // viewport. Every thumbnail is its own screencopy
+                          // stream against the compositor, so keeping all of
+                          // them running for rows scrolled far off-screen is
+                          // sustained GPU and Wayland buffer traffic
+                          // competing with the very frames a smooth scroll
+                          // needs. A row that goes off-screen keeps the last
+                          // frame it captured and resumes streaming before it
+                          // comes back into view.
+                          //
+                          // Deliberately still tied to nothing but the row's
+                          // position, right through the leave. Stopping the
+                          // streams the moment a dive starts looks like an
+                          // obvious saving -- they are about to be scaled off the
+                          // edge of the screen -- but it is a change of state at
+                          // the exact frame that has to be unremarkable, on the
+                          // one surface the eye is following.
+                          live: rowItem.nearViewport
+                          paintCursor: false
+
+                          // No constraintSize. It reads like a cap on how big a
+                          // buffer the compositor is asked for, and it is not
+                          // one: Quickshell feeds it to the view's *implicit*
+                          // size and nothing else, and an anchors.fill view has
+                          // no use for an implicit size. Every thumbnail here
+                          // was streaming its window at full native resolution
+                          // the whole time it claimed to be capped at 1000x400.
+                          // Nothing in the protocol offers a smaller capture
+                          // either -- hyprland_toplevel_export hands over the
+                          // window at the size it is -- so the shrink has to
+                          // happen on this side, which is what captureBox does.
+
+                          // A row created off-screen has no last frame to
+                          // keep, so grab one still for it up front -- but only
+                          // while the overview is actually up. The plugin is
+                          // keepLoaded, so these delegates also exist, and are
+                          // rebuilt every time a window opens or closes, with
+                          // the overview closed and no recording context to
+                          // capture into: asking then is work that can only
+                          // fail, and it logged a warning per thumbnail for the
+                          // privilege.
+                          Component.onCompleted:
+                            if (root.opened && !capture.live) capture.captureFrame()
+                        }
                       }
 
                       // No title bar over the bottom of the thumbnail. At this
