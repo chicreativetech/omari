@@ -2934,13 +2934,10 @@ Item {
                 gestureIdle.stop()
                 if (hDrag) hDrag.endDrag()
               } else if (hDrag) {
-                // Not negated, unlike the vertical axis below: niri moves the
-                // *strip* under two fingers rather than the view over it, so
-                // swiping left carries the columns left and brings the one to
-                // the right into the centre. Matching it here matters more
-                // than matching the axis beside it, because this is the same
-                // gesture, on the same strip of columns, that the scrolling
-                // layout answers when the overview is closed.
+                // Not negated -- see the vertical drag below, which now says
+                // the same thing on its own axis. Two fingers move the strip
+                // of columns, the way niri does and the way the scrolling
+                // layout answers this same gesture with the overview closed.
                 hDrag.dragBy(wheel.pixelDelta.x)
               }
               wheel.accepted = true
@@ -2952,13 +2949,18 @@ Item {
               gestureIdle.stop()
               vScroll.endDrag()
             } else {
-              // Negated: two fingers drag the *view over the stack of
-              // workspaces* rather than the stack itself, so pushing up
-              // brings the row above into the centre. Same sense as the
-              // mouse wheel above. The horizontal drag is the odd one out
-              // on purpose -- it follows niri, which has no opinion about
-              // this axis because it has no vertical stack.
-              vScroll.dragBy(-wheel.pixelDelta.y)
+              // Not negated, and neither is the horizontal drag above: two
+              // fingers move the *stack of workspaces* rather than the view
+              // over it, so pushing up carries the stack up and brings the
+              // row below into the centre. Both touchpad axes now say the
+              // same thing -- the thing under your fingers is the content,
+              // not a viewport over it.
+              //
+              // The mouse wheel above stays negated, on both axes, and that
+              // is not an inconsistency left lying around: a wheel notch is a
+              // request to go somewhere, not a grip on the content, and it
+              // keeps the sense every other wheel on the machine has.
+              vScroll.dragBy(wheel.pixelDelta.y)
             }
             wheel.accepted = true
           }
