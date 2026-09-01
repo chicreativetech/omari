@@ -1,7 +1,7 @@
 #!/bin/bash
 # Turns one of Omari's Hyprland configs on or off and reloads Hyprland.
 #
-#   omari-toggle <mode|overview> [on|off|toggle|status]
+#   omari-toggle <mode|overview|alttab> [on|off|toggle|status]
 #
 # The lua sources live next to this script, inside the plugin directory, and
 # this script finds them relative to itself. Installing the plugin is therefore
@@ -18,7 +18,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: omari-toggle <mode|overview> [on|off|toggle|status]" >&2
+  echo "Usage: omari-toggle <mode|overview|alttab> [on|off|toggle|status]" >&2
 }
 
 if (($# < 1)); then
@@ -30,7 +30,7 @@ NAME="$1"
 ACTION="${2:-toggle}"
 
 case $NAME in
-  mode | overview) ;;
+  mode | overview | alttab) ;;
   *)
     echo "Unknown Omari config: $NAME" >&2
     usage

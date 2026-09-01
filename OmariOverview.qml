@@ -2968,4 +2968,21 @@ Item {
       }
     }
   }
+
+  // Omari's other overlay, which is not an overlay entry point of its own
+  // because there is only one of those to have: shell.qml's computePanelEntries
+  // builds exactly one Loader per plugin id, and Omari's is this file. The
+  // switcher does not want the host's summon/hide anyway -- it opens on a
+  // `custom>>` line from hypr/omari-alttab.lua and closes when the modifier
+  // holding it up comes back up, and neither of those is something the host
+  // can say. It is entirely self-contained: nothing here talks to it, and it
+  // touches nothing here, least of all `opened`, which the host reads to mean
+  // "the overview is showing".
+  //
+  // Inert until its toggle is on, since with no omari-alttab.lua in Omarchy's
+  // toggles directory nothing ever emits the event that opens it.
+  OmariAltTab {
+    id: altTab
+    overview: root
+  }
 }

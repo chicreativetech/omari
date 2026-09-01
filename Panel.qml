@@ -31,6 +31,7 @@ Panel {
   readonly property color barIconColor: modeFlag.enabled ? barForeground : Qt.darker(barForeground, 1.55)
   readonly property string modeToggleHint: modeFlag.enabled ? "Turn Omari mode off" : "Turn Omari mode on"
   readonly property string overviewToggleHint: overviewFlag.enabled ? "Turn the overview swipe off" : "Turn the overview swipe on"
+  readonly property string alttabToggleHint: alttabFlag.enabled ? "Turn the Alt-Tab switcher off" : "Turn the Alt-Tab switcher on"
   readonly property string statusText: modeFlag.error !== "" ? "Omari mode is unavailable"
     : !modeFlag.loaded ? "Checking status…"
     : (modeFlag.enabled ? "Omari mode is on" : "Omari mode is off")
@@ -41,6 +42,7 @@ Panel {
   onOpenedChanged: if (opened) {
     modeFlag.refresh()
     overviewFlag.refresh()
+    alttabFlag.refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -52,6 +54,11 @@ Panel {
   ToggleFlag {
     id: overviewFlag
     flagName: "overview"
+  }
+
+  ToggleFlag {
+    id: alttabFlag
+    flagName: "alttab"
   }
 
   IpcHandler {
@@ -84,7 +91,7 @@ Panel {
     }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) modeFlag.toggle()
-      else if (buttonCode === Qt.MiddleButton) { modeFlag.refresh(); overviewFlag.refresh() }
+      else if (buttonCode === Qt.MiddleButton) { modeFlag.refresh(); overviewFlag.refresh(); alttabFlag.refresh() }
       else root.toggle()
     }
   }
@@ -114,6 +121,7 @@ Panel {
       onTextKey: function(t) {
         if (t === "o" || t === "O") modeFlag.toggle()
         else if (t === "v" || t === "V") overviewFlag.toggle()
+        else if (t === "t" || t === "T") alttabFlag.toggle()
       }
 
       Column {
@@ -215,6 +223,48 @@ Panel {
           width: parent.width
           visible: overviewFlag.error !== ""
           text: overviewFlag.error
+          wrapMode: Text.WordWrap
+          color: Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        PanelSeparator {
+          foreground: root.foreground
+        }
+
+        Text {
+          width: parent.width
+          text: "Alt-Tab becomes niri's window switcher: hold ALT (or SUPER) and press Tab to walk a row of live window thumbnails, release to land on one. While it is up, A, W and O narrow the row to all windows, this workspace's, or this monitor's. Replaces Omarchy's ALT+Tab and SUPER+Tab; SUPER+PageDown/PageUp still change workspace."
+          wrapMode: Text.WordWrap
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Toggle {
+          id: alttabToggle
+          width: parent.width
+          label: "Enable Alt-Tab switcher"
+          checked: alttabFlag.enabled
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: alttabFlag.toggle()
+          onHovered: function(isHovered) { alttabToggle.isHovering = isHovered }
+
+          property bool isHovering: false
+
+          PanelToolTip {
+            visible: alttabToggle.isHovering
+            text: root.alttabToggleHint
+            fontFamily: root.fontFamily
+          }
+        }
+
+        Text {
+          width: parent.width
+          visible: alttabFlag.error !== ""
+          text: alttabFlag.error
           wrapMode: Text.WordWrap
           color: Color.urgent
           font.family: root.fontFamily
