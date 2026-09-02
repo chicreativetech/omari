@@ -34,9 +34,13 @@ Down to the next workspace, Up to the previous, dispatching the same
 `e+1`/`e-1` as Omarchy's own `SUPER+TAB`, which keeps working alongside
 them. Both bindings appear and disappear with the mode.
 
-A bar icon opens a popup explaining the mode with two independent toggles —
-one for the scrolling-layout mode, one for the overview — styled with
-Omarchy's native panel components (`Panel`, `PanelHero`, `Ui.Toggle`).
+A bar icon opens a popup explaining the mode with three toggles — scrolling
+layout, overview, and Alt-Tab — styled with Omarchy's native panel components
+(`Panel`, `PanelHero`, `Ui.Toggle`). The overview and Alt-Tab hang off the
+mode: their switches are only shown while it is on, turning it off takes both
+features down with it, and turning it back on restores the ones that were up.
+The overview draws the scrolling layout's workspaces and Alt-Tab walks the same
+tape, so neither is meant to be left running on a stock Hyprland layout.
 
 The overview (`OmariOverview.qml`) is a full-screen layer-shell surface: one
 row per workspace that has windows, rows scrolling vertically. It opens
@@ -89,6 +93,25 @@ show what you would actually be looking at were you on that workspace. It is
 nudged off that only as far as it must be to bring the ringed window inside the
 wallpaper, for when left/right has walked past the part of the strip the
 monitor covers.
+
+**Scrolling a row is a real change to that workspace, and it sticks.** A row
+the user has scrolled remembers where to, keyed by workspace id, and holds it
+after the row stops being the centred one — rows used to snap back to
+Hyprland's own focused window the instant you moved off them, so scrolling row
+1 to its last window and then dropping to row 3 undid the scroll on the way
+past. Untouched rows still follow Hyprland's focus, which is what makes an
+untouched row a truthful picture of its workspace.
+
+Every scrolled row is then handed to the compositor in the same batch that
+leaves the overview, in front of the destination dispatch. There is no
+dispatcher for "scroll this workspace to here": a scrolling layout is scrolled
+by focusing something, and focusing follows the workspace — so each of those
+switches the active workspace as it runs, which is precisely why they go first
+and the destination goes last. The batch runs in order inside Hyprland, all of
+it inside the round trip the leave was already making, behind a backdrop that
+is already opaque. Rows whose remembered window is already the focused one are
+dropped, so an overview that was only looked at sends nothing extra. Escape and
+a click on the backdrop are still a cancel and commit nothing.
 
 One consequence worth knowing: Hyprland reports a monitor's size in *physical*
 pixels but window geometry in *logical* ones, so the monitor is divided back
@@ -316,6 +339,102 @@ rather than on every summon — worth another ~250ms per open, measured — and 
 rows survive between summons already laid out, which is what lets the zoom be
 measured on the very first frame.
 
+**No thumbnail is ever a live stream.** A live `ScreencopyView` is not something
+the compositor pushes at you, it is a loop you hold open: each arriving frame
+dirties the view, the view repaints, Quickshell re-arms the capture from that
+repaint, and the next frame arrives to dirty it again. So a visible thumbnail
+renders at the display's refresh rate for as long as it is on screen — whether
+or not the window in it has changed a single pixel — and here every one of
+those frames also re-renders a supersampled offscreen layer and rebuilds its
+mipmap chain, which for a full-screen window on a 2736×1824 panel is a
+2572×1720 texture. Measured: two thumbnails at overview geometry held the
+renderer at 66fps with the overview open, still, and untouched. The same two
+frozen sat at 1.2fps.
+
+Instead there is a **capture budget** — six captures a second for the whole
+overview, handed to whichever thumbnail most needs one. The reason it is a
+budget rather than tighter position gating is that a budget's cost does not
+scale with how many thumbnails are on screen and live capture's does, and a
+machine with a lot of windows is exactly the one that cannot afford the
+difference. Six is off the measured curve rather than off the feel of it: idle
+cost falls about linearly up to ~12/s and is indistinguishable from fully live
+at 30/s and above, so a faster budget pays live's price without live's
+freshness. On a screenful of six or eight thumbnails each is refreshed about
+once a second — invisible on a static window, alive on a terminal, a slideshow
+on video.
+
+The budget is spent in priority order: the zoom's target ahead of everything
+(it bypasses the budget entirely, on both the opening and the dive), then any
+on-screen thumbnail with no picture at all, then the stalest on-screen picture,
+then the render margin kept warm for a scroll that may never arrive. Nothing is
+spent at all while the overview is moving on any of its three axes, and the
+token bucket holds at most one — so the frame a gesture settles on can spend a
+single capture and no more, which is the burst that made the older
+freeze-during-motion attempts worse than doing nothing.
+
+It is driven by a `Timer` and deliberately not by a `FrameAnimation`. A
+`FrameAnimation` asks the renderer for a frame on every frame — that is the
+whole of what it is — so one driving the scheduler would pin the render loop at
+refresh rate and hand back none of the saving. Measured, a `FrameAnimation`
+issuing no captures at all cost 67fps of idle rendering, which is exactly what
+leaving every thumbnail live costs.
+
+**What is off the screen is not drawn, not merely clipped.** A row past the
+viewport keeps its wallpaper's shadow layer and every one of its thumbnails'
+supersampled, mipmapped layers allocated and up to date for as long as it
+exists, so on a ten-workspace machine most of the overview's texture footprint
+was rows nobody could see. Rows more than a stride out are `visible: false`
+instead, which takes the whole subtree out of the scene graph — and they come
+back a stride *before* they start capturing, so the frame that brings a row on
+screen is never also the frame that builds its layers.
+
+That is why the rows are not in a `Column` any more. A positioner lays out only
+its visible children and closes the gap an invisible one leaves, so with one
+there no row could be dropped without every row below it sliding up a slot. The
+rows place themselves at `index * rowStride` inside a plain `Item`, which is the
+number `centerPositionFor`, the snap points and `viewportY` were all computing
+anyway. It also removes a trap the dive used to fall into: a delegate's `y` is
+now a binding on its own index, right from the instant it is created, rather
+than a positioner's output that arrives a pass later.
+
+**A window scrolled off its own row is not refreshed either.** The vertical half
+of that test was always here; a scrolling layout is what makes the horizontal
+half necessary. A workspace strip is routinely two and a half monitors wide and
+a row shows about two of them, so a visible row would otherwise be spending the
+capture budget on windows sitting a screen's width past its own edge.
+
+**Hovering a thumbnail no longer reallocates its texture.** The ring used to be
+the thumbnail's own border, with the capture inset by its width so the video
+did not paint over it — and since the ring appears on hover, every pointer
+crossing resized the capture by two pixels. That item's size *is* its layer's
+texture size, so moving the mouse across the overview allocated and re-rendered
+a fresh offscreen buffer, at up to twice device size, for every thumbnail it
+passed over. The ring is a sibling drawn over the capture now: the same two
+pixels, the same colour, and nothing underneath moves when it comes and goes.
+
+The wallpaper path is resolved by a process (`readlink` on the symlink the
+background plugin follows), and that spawn used to happen at the summon, racing
+the two frames the opening zoom is measured from for an answer that is the same
+one it gave last time on every open but the one after a theme change. It is
+probed at shell start and then a third of a second into each summon instead,
+which is after the zoom rather than across it.
+
+The Alt-Tab row does the same accounting for the same reason, minus the zoom it
+does not have: a card past the edge of the screen neither draws nor streams, and
+starts doing both as the strip slides it in. A row of every window open is
+several screens long, and starting fifteen streams to draw the four you can see
+is a cost paid in the same breath as the keypress.
+
+Sorting a row's windows into left-to-right order asks Hyprland's geometry for
+each window once, rather than once per comparison. The sort is re-derived per
+row every time a geometry query lands with the overview up, and the comparator
+form of it measured every window several times over and discarded all but one
+of the answers.
+
+The three feature flags are probed once at startup and whenever the popup is
+opened. They are not polled while the keep-loaded plugin sits in the bar, which
+avoids nine short-lived shell processes per minute doing invisible work.
+
 The zoom itself is driven by a `FrameAnimation` rather than a `NumberAnimation`,
 because a wall-clock animation started for that first frame is simply over by
 the time the second one is drawn: the overview snapped into place instead of
@@ -434,10 +553,12 @@ deliberately not built out of animated offsets:
   followed instantly for the first frames after opening, while geometry and
   screencopy aspect ratios are still resolving, and animated after that.
 
-Thumbnails capture live only while their row is at or near the viewport.
-Every thumbnail is its own screencopy stream against the compositor, so
-keeping all of them running for rows scrolled off-screen is sustained GPU and
-Wayland buffer traffic competing with the frames a smooth scroll needs.
+Thumbnails are refreshed first while their row is at or near the viewport, and
+while they are near the part of that row which is on screen; everything else
+inside the render margin is kept warm at a much slower rate. Both bounds are
+about where the budget is *spent*, not about what is allowed to capture —
+`captureFrame()` is not paint-driven, so a thumbnail whose whole subtree is
+`visible: false` refreshes perfectly well when asked. See *Opening cost*.
 
 ## Install
 
@@ -457,30 +578,53 @@ want. Each one writes its config and reloads Hyprland for you; nothing else
 has to be set up first.
 
 To install under a different id, rename the directory and change `id` in
-`manifest.json` to match — and also the two `bergdahlchi.omari` references in
-`hypr/omari-overview.lua`, which is what the swipe and `SUPER+ALT+O` summon.
+`manifest.json` to match — and update the hard-coded id in `Panel.qml` and
+`hypr/omari-overview.lua`, which route panel IPC and overview summon requests.
 
 ## Uninstall
 
-Turn both switches off (that removes the Hyprland config and reloads), then:
+Use Omarchy's plugin remover:
 
 ```bash
-omarchy plugin disable bergdahlchi.omari
-rm -rf ~/.config/omarchy/plugins/bergdahlchi.omari
+omarchy plugin remove bergdahlchi.omari
+```
+
+Omarchy disables the plugin before deleting it. Omari uses that lifecycle
+boundary to remove all three generated Hyprland toggle files and reload
+Hyprland, while deliberately leaving them alone during normal shell restarts
+and plugin hot reloads. Nothing remains active after removal.
+
+There is exactly one thing left behind, and only by the one uninstall Omarchy
+does not perform: deleting the plugin directory by hand. The cleanup is the
+plugin's own code, so a checkout removed without ever being disabled never runs
+it, and the three copies in `~/.local/state/omarchy/toggles/hypr/` stay there —
+sourced on every Hyprland reload, by a plugin that is no longer installed. Turn
+the switches off first, or run the cleanup before deleting:
+
+```bash
+bash ~/.config/omarchy/plugins/bergdahlchi.omari/bin/omari-toggle all off
 ```
 
 ## How it works
 
-- `hypr/omari-mode.lua` and `hypr/omari-overview.lua` are not loaded
+- The three `hypr/omari-*.lua` files are not loaded
   directly. Turning one on copies it into
-  `~/.local/state/omarchy/toggles/hypr/omari-{mode,overview}.lua`, a
+  `~/.local/state/omarchy/toggles/hypr/omari-{mode,overview,alttab}.lua`, a
   directory Omarchy's default toggle loader already sources on every
   Hyprland reload — the same contract `omarchy-hyprland-toggle` uses for
   Omarchy's own flags, just sourced from the plugin instead of
   `$OMARCHY_PATH`.
-- `bin/omari-toggle <mode|overview> [on|off|toggle|status]` is what does
-  that. It finds the lua sources relative to its own path, which is what
-  makes the plugin directory self-contained: an install that has never seen
+- `bin/omari-toggle <mode|overview|alttab> [on|off|toggle|status]` is what does
+  that, and the cascade lives here rather than in the popup, so the CLI and the
+  plugin's IPC `enable`/`disable` get it too: `mode off` removes the overview
+  and Alt-Tab flags after recording which of them were on in
+  `$XDG_STATE_HOME/omari/suspended`, and `mode on` puts exactly those back and
+  deletes the memo. One `hyprctl reload` covers the whole cascade. The memo
+  lives outside the toggles directory because that directory is sourced as lua,
+  and only the two names this script writes are honoured when it is read back.
+  `all off` clears it, so nothing resurrects on the next `mode on`. It finds the
+  lua sources relative to its own path, which is what makes the plugin
+  directory self-contained: an install that has never seen
   Omari before can apply the config from the switch alone. `ToggleFlag.qml`
   is the state machine `Panel.qml` instantiates once per switch; it resolves
   the plugin directory from its own QML url and runs the script out of it.

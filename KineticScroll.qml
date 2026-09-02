@@ -93,8 +93,10 @@ Item {
   // full braking force right up to the moment it snaps to a stop, which
   // reads as abrupt; decaying proportional to the current speed brakes hard
   // while fast and tapers off the harder it already slowed, so the coast
-  // eases out instead of cutting off.
-  property real momentumTau: 1.6    // s, momentum decay time constant
+  // eases out instead of cutting off. Shortened from 1.6s: a coast that long
+  // kept drifting well after the fingers were off the pad, which is half of
+  // what read as an over-sensitive touchpad.
+  property real momentumTau: 0.85   // s, momentum decay time constant
   property real maxVelocity: 18000  // px/s, cap on a flick
   property real minVelocity: 25     // px/s, below this momentum has stopped
   // bandTau doubles as the edge spring's stiffness (w = 1/bandTau below): the
@@ -102,16 +104,16 @@ Item {
   // back rigidly the instant a drag or flick went past an edge. A longer time
   // constant is a softer spring -- more give, a gentler settle. 0.35 was that
   // correction overshooting the other way: the ease-out read as slow once
-  // every row bounced. Tuned down from there by feel, and it wants to stay
-  // well above the 0.085 end -- the point is that the row eases home, not
-  // that it snaps.
-  property real bandTau: 0.185      // s, rubber-band spring time constant
-  property real glideTau: 0.18      // s, discrete-wheel / snap glide time constant
+  // every row bounced. Tuned down from there by feel toward the stiff end,
+  // but deliberately still above 0.085 -- the point is that the row eases
+  // home, not that it snaps.
+  property real bandTau: 0.13       // s, rubber-band spring time constant
+  property real glideTau: 0.12      // s, discrete-wheel / snap glide time constant
   // How much of the release speed is carried into a snapped axis' landing
   // point. Long enough that a deliberate flick travels past the row it was
   // over, short enough that letting go of a slow drag lands on the nearest
   // one rather than sailing away.
-  property real snapProjection: 0.3 // s
+  property real snapProjection: 0.2 // s
 
   // ---- state out ----
 
@@ -134,6 +136,14 @@ Item {
   // mid-gesture (a thumbnail's aspect ratio landing, a row appearing) cannot
   // fight the drag.
   property bool dragging: false
+
+  // True for every kind of motion this component can produce. Owners use this
+  // to hold back work that can wait while the scene graph is already busy
+  // translating their last frame -- the overview's capture scheduler reads it
+  // on both axes and spends none of its budget until every one of them is
+  // false. `dragging` alone misses momentum, snapping, and keyboard/wheel
+  // glides, which is most of the motion that matters here.
+  readonly property bool moving: root.dragging || runner.running
 
   // False for the first frames after the view opens, while geometry and
   // thumbnail aspect ratios are still resolving and restPosition therefore

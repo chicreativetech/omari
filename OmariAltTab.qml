@@ -8,9 +8,14 @@ import qs.Commons
 // Omari Alt-Tab: niri's window switcher.
 //
 // One long row of live window thumbnails, most-recently-used first, held up
-// for exactly as long as the modifier that opened it is held down. Tab walks
-// along the row, releasing ALT (or SUPER) focuses whatever it stopped on, and
-// A/W/O narrow the row to all windows, this workspace's, or this monitor's.
+// for exactly as long as the ALT that opened it is held down. Tab walks along
+// the row, releasing ALT focuses whatever it stopped on, and A/W/O narrow the
+// row to all windows, this workspace's, or this monitor's.
+//
+// ALT and only ALT. The switcher used to open on SUPER+TAB as well, and the
+// scope filter could not work there: SUPER+A/W/O are Omarchy's own binds, so
+// the compositor ate the three keys that make this niri's switcher rather than
+// a nicer ALT+TAB. See hypr/omari-alttab.lua.
 //
 // Instantiated by OmariOverview.qml rather than being an entry point of its
 // own: Omarchy's plugin host mounts exactly one Loader per plugin id (see
@@ -33,9 +38,9 @@ Item {
 
   // ---- session state ----
   //
-  // A "session" is one press-and-hold of ALT (or SUPER). It starts on the
-  // first `omari:alttab step` event, and ends when that modifier is released,
-  // which commits, or on Escape/a click, which does not.
+  // A "session" is one press-and-hold of ALT. It starts on the first
+  // `omari:alttab step` event, and ends when ALT is released, which commits,
+  // or on Escape/a click, which does not.
   property bool active: false
   property bool leaving: false
 
@@ -45,9 +50,60 @@ Item {
   // everything that means the second one asks this.
   readonly property bool surfaceLive: root.active || root.leaving
 
-  // "alt" or "super": which modifier this session is riding on, so the release
-  // that ends it is the one that started it. SUPER+TAB does not close on ALT.
-  property string holdMod: ""
+  // ---- the capture scheduler ----
+  //
+  // The same mechanism as OmariOverview.qml's, and for the same reason: a
+  // live ScreencopyView re-arms itself from its own repaint, so a card that
+  // is merely on screen renders at the display's refresh rate for as long as
+  // the switcher is up, whether or not the window in it has changed. A
+  // switcher held open on ALT for a few seconds was doing that for every card
+  // in the row at once.
+  //
+  // Smaller and simpler than the overview's, because the surfaces are: there
+  // is no zoom, no mipmapped layer, and nothing here is watched -- a switcher
+  // is looked at to tell windows apart, not to see what they are doing. One
+  // reasonably fresh picture per card is the whole requirement.
+  readonly property real captureBudget: 12
+  readonly property int captureCooldownMs: 1500
+  property real captureTokens: 0
+
+  // A Timer, never a FrameAnimation: a FrameAnimation asks the renderer for a
+  // frame on every frame, which would hold the render loop up at exactly the
+  // rate this exists to stop. See the longer note in OmariOverview.qml.
+  Timer {
+    id: captureTick
+    interval: 80
+    repeat: true
+    running: root.surfaceLive
+    onTriggered: root.captureTock()
+  }
+
+  // Blank first, then stalest. A card that has never been captured is drawn
+  // as an empty rectangle, so it is worth jumping the queue for; everything
+  // else already has a picture and is only being freshened.
+  function captureNext() {
+    var now = Date.now()
+    var blank = null
+    var stale = null, staleAge = -1
+    for (var i = 0; i < cards.count; i++) {
+      var c = cards.itemAt(i)
+      if (!c || !c.requestCapture || !c.near) continue
+      if (!c.hasPicture) { if (!blank) blank = c; continue }
+      var age = now - c.lastCaptureMs
+      if (age >= root.captureCooldownMs && age > staleAge) { staleAge = age; stale = c }
+    }
+    return blank || stale
+  }
+
+  function captureTock() {
+    if (!root.surfaceLive || root.leaving) return
+    root.captureTokens = Math.min(1, root.captureTokens + root.captureBudget * (captureTick.interval / 1000))
+    if (root.captureTokens < 1) return
+    var c = root.captureNext()
+    if (!c) return
+    root.captureTokens -= 1
+    c.requestCapture()
+  }
 
   // "all" | "workspace" | "output" -- niri's three scopes, on A, W and O.
   property string scope: "all"
@@ -191,18 +247,14 @@ Item {
 
   // The event from hypr/omari-alttab.lua, whether or not a session is already
   // up: the first one opens the switcher, every one after it walks the row.
-  function step(mod, dir) {
-    if (!root.active) { root.begin(mod, dir); return }
-    // A session opened on ALT and continued on SUPER is not a thing anyone
-    // means to do, but if the compositor says it happened, the release that
-    // ends the session should be the one the user is actually holding.
-    root.holdMod = mod
+  function step(dir) {
+    if (!root.active) { root.begin(dir); return }
     if (root.count === 0) return
     var delta = (dir === "prev") ? -1 : 1
     root.selected = ((root.selected + delta) % root.count + root.count) % root.count
   }
 
-  function begin(mod, dir) {
+  function begin(dir) {
     if (root.overview && root.overview.opened) return
     // Fresh geometry and titles for the row about to be drawn. Asynchronous,
     // so the row is built from what is already known and corrects itself a
@@ -215,7 +267,6 @@ Item {
     root.sessionWorkspaceId = workspace ? Number(workspace.id) : -1
     root.sessionMonitorId = monitor ? Number(monitor.id) : -1
 
-    root.holdMod = mod
     root.scope = "all"
     root.entries = root.snapshot()
 
@@ -291,7 +342,6 @@ Item {
     root.leaving = false
     root.exitOpacity = 1
     root.entries = []
-    root.holdMod = ""
     root.selected = 0
     root.scope = "all"
   }
@@ -403,7 +453,7 @@ Item {
       var parts = data.split(" ")
       switch (parts[1]) {
       case "step":
-        root.step(parts[2], parts[3])
+        root.step(parts[2])
         break
       case "commit":
         root.commit(null)
@@ -590,10 +640,7 @@ Item {
       // `active` already false.
       Keys.onReleased: function(event) {
         if (!root.active || event.isAutoRepeat) return
-        var isHold = (root.holdMod === "alt" && event.key === Qt.Key_Alt)
-          || (root.holdMod === "super" && (event.key === Qt.Key_Super_L
-            || event.key === Qt.Key_Super_R || event.key === Qt.Key_Meta))
-        if (!isHold) return
+        if (event.key !== Qt.Key_Alt) return
         root.commit(null)
         event.accepted = true
       }
@@ -754,6 +801,38 @@ Item {
                 : panel.tileHeight
               readonly property real tileWidth: Math.round(card.tileHeight * card.modelData.aspect)
 
+              // Whether this card is anywhere near the screen.
+              //
+              // A row of every window open is routinely several screens long,
+              // and every card on it is a full-resolution capture of its
+              // window. Opening the switcher used to start a live stream for
+              // all of them at once, in the same breath as the keypress: on a
+              // machine with fifteen windows that is fifteen streams begun to
+              // draw the four you can see, at the one moment a switcher has to
+              // be instant. A card past the edge is neither drawn nor eligible
+              // for the capture budget, and becomes both as the strip slides
+              // it in -- a card's width of slack ahead of the edge, so it has
+              // a picture before it is looked at.
+              //
+              // strip.x is animated, so this follows the slide rather than
+              // being decided once when the selection moves.
+              readonly property bool near: {
+                var left = card.x + strip.x
+                var slack = panel.tileHeight * 2
+                return left + card.width > -slack && left < viewport.width + slack
+              }
+
+              visible: card.near
+
+              // What the scheduler above reads. Kept on the delegate so it
+              // cannot outlive the card it describes.
+              property real lastCaptureMs: 0
+              readonly property bool hasPicture: shotView.hasContent
+              function requestCapture() {
+                shotView.captureFrame()
+                card.lastCaptureMs = Date.now()
+              }
+
               x: panel.cardXAt(card.index)
               y: 0
               width: panel.cardWidthAt(card.index)
@@ -801,19 +880,40 @@ Item {
                   Behavior on height { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
                   ScreencopyView {
+                    id: shotView
                     anchors.fill: parent
                     captureSource: card.modelData.toplevel.wayland
-                    // Live for the whole session and no longer. A switcher is
-                    // up for a second or two at a time, and every thumbnail is
-                    // its own screencopy stream against the compositor: the
-                    // overview can afford to keep streams alive off-screen
-                    // because it is scrolled through, this cannot afford to
-                    // keep any alive at all once it is down.
-                    live: root.surfaceLive
+                    // Never live; the scheduler at the top of this file hands
+                    // out frames instead. The gating this replaces was on
+                    // position, and position was never the expensive part: a
+                    // live view re-arms from its own repaint, so a card that
+                    // is on screen at all renders at refresh rate for as long
+                    // as the switcher is held open.
+                    //
+                    // A card that has never been captured is the one case the
+                    // scheduler treats as urgent -- see captureNext -- because
+                    // until it has a picture it is an empty rectangle with a
+                    // title under it. Cards keep their pictures between
+                    // invocations (the surface stays mapped for the life of
+                    // the shell), so a reopened switcher is refreshing rather
+                    // than filling, and nothing pops in.
+                    live: false
                     paintCursor: false
-                    constraintSize: Qt.size(
-                      Math.round(panel.selectedTileHeight * 3.2 * Screen.devicePixelRatio),
-                      Math.round(panel.selectedTileHeight * Screen.devicePixelRatio))
+
+                    // No constraintSize. It reads like a cap on how big a
+                    // buffer the compositor is asked for and it is not one:
+                    // Quickshell feeds it to the view's *implicit* size and
+                    // nothing else, and an anchors.fill view has no use for an
+                    // implicit size -- so every card here was streaming its
+                    // window at full native resolution the whole time this
+                    // claimed to be capping it. The same discovery is written
+                    // up at greater length in OmariOverview.qml; what that
+                    // file does about it (a supersampled, mipmapped layer to
+                    // take the shrink away from the view's hardcoded bilinear
+                    // filter) is deliberately not done here, because this
+                    // surface is up for a second at a time and never moves
+                    // under a zoom, so there is nothing for the shimmer to
+                    // crawl across.
                   }
                 }
 

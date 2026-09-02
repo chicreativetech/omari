@@ -1,4 +1,4 @@
--- Omari Alt-Tab: niri's window switcher, on ALT+TAB and SUPER+TAB.
+-- Omari Alt-Tab: niri's window switcher, on ALT+TAB.
 --
 -- This file is NOT loaded directly, and does not need to be copied anywhere.
 -- It ships inside the Omari plugin directory; turning Alt-Tab on (the bar
@@ -13,6 +13,14 @@
 -- the thumbnails, the scope filter and the focus dispatch are all at the other
 -- end, in OmariAltTab.qml -- see the comments there.
 --
+-- ALT and only ALT. The switcher used to ride SUPER+TAB as well, and it did
+-- not work there: with SUPER held, A, W and O -- the scope filter, the thing
+-- that makes this niri's switcher and not just a nicer ALT+TAB -- are
+-- SUPER+A/W/O, keys Omarchy binds to its own commands, so the filter was
+-- unreachable for exactly the modifier that had two ways to open the row.
+-- SUPER+TAB is left to Omarchy's own "next workspace" bind, which is what it
+-- meant before this file existed.
+--
 -- What goes out is hl.dsp.event, which puts a single `custom>>...` line on
 -- Hyprland's event socket, the socket the overlay is already listening to.
 -- Deliberately NOT exec_cmd: that spawns a process, and a switcher that lags
@@ -22,15 +30,11 @@ local function emit(msg)
   hl.dispatch(hl.dsp.event(msg))
 end
 
--- The two keys each modifier can be held down with. Both are checked, so the
--- switcher rides the right Alt as readily as the left one.
-local mod_keys = {
-  alt = { "Alt_L", "Alt_R" },
-  super = { "Super_L", "Super_R" },
-}
+-- Both Alts, so the switcher rides the right one as readily as the left.
+local ALT_KEYS = { "Alt_L", "Alt_R" }
 
-local function mod_held(which)
-  for _, key in ipairs(mod_keys[which] or {}) do
+local function alt_held()
+  for _, key in ipairs(ALT_KEYS) do
     -- pcall because is_key_down is asked about a keysym name: a layout that
     -- does not have one would otherwise take the watchdog down with it, and
     -- the watchdog is the safety net rather than the mechanism.
@@ -60,20 +64,20 @@ end
 -- masks. 30ms is a third of a frame at 100Hz: the commit is not perceptibly
 -- behind the finger, and it only runs while the switcher is actually up.
 local session = {
-  mod = nil, -- "alt"/"super" while the switcher is up, nil otherwise
-  armed = false, -- whether the modifier has been *seen* held at least once
+  watching = false, -- whether a switcher is up and waiting on the release
+  armed = false, -- whether ALT has been *seen* held at least once
   ticks = 0,
   timer = nil,
 }
 
--- How long the watchdog waits to see the modifier held before giving up on
--- ever seeing it. Reached only if is_key_down cannot answer for this keyboard
--- at all, in which case the overlay's own key handling is the whole story and
--- a timer polling forever is nothing but load. Two seconds at 30ms.
+-- How long the watchdog waits to see ALT held before giving up on ever seeing
+-- it. Reached only if is_key_down cannot answer for this keyboard at all, in
+-- which case the overlay's own key handling is the whole story and a timer
+-- polling forever is nothing but load. Two seconds at 30ms.
 local ARM_DEADLINE = 66
 
 local function stop_watch()
-  session.mod = nil
+  session.watching = false
   session.armed = false
   session.ticks = 0
   if session.timer then
@@ -82,15 +86,15 @@ local function stop_watch()
 end
 
 local function tick()
-  if not session.mod then
+  if not session.watching then
     return
   end
-  if mod_held(session.mod) then
-    -- Arm on the first frame the modifier is genuinely seen down. Until then a
-    -- "not held" reading means "cannot tell yet", not "let go" -- the bind
-    -- fires on the Tab press, which can land a frame before the key state this
-    -- reads has caught up, and committing on that would close the switcher in
-    -- the same breath that opened it.
+  if alt_held() then
+    -- Arm on the first frame ALT is genuinely seen down. Until then a "not
+    -- held" reading means "cannot tell yet", not "let go" -- the bind fires on
+    -- the Tab press, which can land a frame before the key state this reads
+    -- has caught up, and committing on that would close the switcher in the
+    -- same breath that opened it.
     session.armed = true
     return
   end
@@ -103,8 +107,8 @@ local function tick()
   end
 end
 
-local function watch(which)
-  session.mod = which
+local function watch()
+  session.watching = true
   session.armed = false
   session.ticks = 0
   -- One timer for the life of the config, enabled and disabled rather than
@@ -118,38 +122,28 @@ end
 
 -- ------------------------------------------------------------------- binds
 --
--- `which` is the modifier the switcher is riding on and `dir` the way the
--- selection moves, both passed through to the overlay: it is the end that
--- knows what is in the list, and this end does not need to.
-local function step(which, dir)
+-- `dir` is the way the selection moves, passed through to the overlay: it is
+-- the end that knows what is in the list, and this end does not need to.
+local function step(dir)
   return function()
-    emit("omari:alttab step " .. which .. " " .. dir)
-    watch(which)
+    emit("omari:alttab step " .. dir)
+    watch()
   end
 end
 
--- Omarchy binds all four of these already -- ALT+TAB twice over (cycle_next
--- and bring_to_top), SUPER+TAB to the next workspace -- and the point of this
--- toggle is to replace them, so they go first. Unbinding by key rather than by
--- handle is deliberate: these are somebody else's binds, and the key is the
--- only thing this file can know about them.
---
--- SUPER+TAB's old meaning is not lost while this is on: omari-mode.lua binds
--- SUPER+PageDown/PageUp to the same next/previous workspace dispatch, and
--- Omarchy's own SUPER+CTRL+TAB ("Former workspace") is untouched.
+-- Omarchy binds ALT+TAB already -- twice over, cycle_next and bring_to_top --
+-- and the point of this toggle is to replace it, so it goes first. Unbinding
+-- by key rather than by handle is deliberate: these are somebody else's binds,
+-- and the key is the only thing this file can know about them.
 hl.unbind("ALT + TAB")
 hl.unbind("ALT + SHIFT + TAB")
-hl.unbind("SUPER + TAB")
-hl.unbind("SUPER + SHIFT + TAB")
 
 -- `repeating`, so holding TAB down runs along the row at the keyboard's own
 -- repeat rate instead of stopping on the second window. That is what the key
 -- does in every other switcher, and the row is exactly the thing you want to
 -- travel along.
-o.bind("ALT + TAB", "Switch windows", step("alt", "next"), { repeating = true })
-o.bind("ALT + SHIFT + TAB", "Switch windows (backwards)", step("alt", "prev"), { repeating = true })
-o.bind("SUPER + TAB", "Switch windows", step("super", "next"), { repeating = true })
-o.bind("SUPER + SHIFT + TAB", "Switch windows (backwards)", step("super", "prev"), { repeating = true })
+o.bind("ALT + TAB", "Switch windows", step("next"), { repeating = true })
+o.bind("ALT + SHIFT + TAB", "Switch windows (backwards)", step("prev"), { repeating = true })
 
 -- The overlay closing for a reason of its own -- Escape, a click, a commit it
 -- made itself -- says so, so the watchdog stops polling for a release nobody

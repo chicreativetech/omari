@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "bergdahlchi.omari",
   "name": "Omari",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "bergdahlchi",
   "license": "MIT",
-  "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, column-aware focus, SUPER+PageDown/PageUp workspace switching), a niri-style overview on a stageless 4-finger swipe, and a niri-style Alt-Tab switcher on ALT/SUPER+Tab with A/W/O scope filtering.",
+  "description": "Toggle Omari mode: niri-like scrollable tiling for Omarchy (scrolling layout, 3-finger swipe, column-aware focus, SUPER+PageDown/PageUp workspace switching), a niri-style overview on a stageless 4-finger swipe, and a niri-style Alt-Tab switcher on ALT+Tab with A/W/O scope filtering.",
   "keepLoaded": true,
   "kinds": [
     "bar-widget",

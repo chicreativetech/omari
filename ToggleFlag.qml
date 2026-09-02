@@ -9,14 +9,21 @@ import Quickshell.Io
 // never seen Omari before, with nothing to copy into ~/.config/hypr or
 // ~/.config/omarchy/bar/scripts first.
 //
-// Panel.qml instantiates one of these per config ("mode", "overview"), which
+// Panel.qml instantiates one per config ("mode", "overview", "alttab"), which
 // is why the state machine lives here rather than being written twice.
 Item {
   id: root
 
-  // "mode" or "overview" -- the suffix in hypr/omari-<name>.lua, the toggles
+  // The suffix in hypr/omari-<name>.lua, the toggles
   // directory's flag file, and the script's own argument.
   required property string flagName
+
+  // Emitted once a toggle attempt has landed, whatever it landed on. One
+  // script run can change more than one flag -- `mode off` takes the overview
+  // and Alt-Tab down with it, `mode on` puts them back -- and the flags that
+  // did not run the script have no way to notice. Panel.qml hangs the other
+  // two's refresh off the mode flag's copy of this.
+  signal settled()
 
   property bool enabled: false
   property bool loaded: false
@@ -181,6 +188,9 @@ Item {
         // just set here survives it.
         root.refresh()
       }
+      // Also on failure: a cascade that got halfway leaves the other flags
+      // wrong on screen, and a failed run is exactly when that is likeliest.
+      root.settled()
     }
 
     onExited: function(exitCode) {
@@ -198,16 +208,10 @@ Item {
     }
   }
 
-  // The flag only ever changes because something on this machine ran the
-  // toggle script, so a slow poll is purely a safety net for a toggle made
-  // outside the bar (the keybinding, the gesture, an edit by hand) -- the
-  // popup's own toggles update their state from the script's reply.
-  Timer {
-    interval: 20000
-    running: true
-    repeat: true
-    onTriggered: root.refresh()
-  }
-
+  // Panel.qml refreshes every flag whenever the popup opens. Polling while it
+  // is closed used to spawn three bash processes every 20 seconds for the
+  // lifetime of the shell, despite there being no visible switch to update.
+  // The initial probe below keeps the bar icon correct at startup; the popup
+  // open is the synchronization point for changes made externally.
   Component.onCompleted: refresh()
 }

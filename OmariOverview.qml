@@ -23,6 +23,7 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
+  property var pluginRegistry: null
 
   property bool opened: false
 
@@ -44,9 +45,33 @@ Item {
   property int selectedWorkspaceId: -1
   property int selectedApp: 0
 
+  // Where the user has scrolled each row to, keyed by workspace id -- and only
+  // rows the user has actually scrolled or arrowed are in here.
+  //
+  // selectedApp is the *centred* row's selection and nothing else's; every
+  // other row draws itself from rowItem.focusedIndex, i.e. from whatever
+  // Hyprland has focused on that workspace. That is the right default for a
+  // row nobody has touched -- it is what the workspace really looks like --
+  // and it was flatly wrong for one that had been scrolled, because moving
+  // off the row put it straight back: scroll row 1 to its last window, drop
+  // to row 3, and row 1 glided home the moment it stopped being centred. The
+  // selection carrying it lived in selectedApp, and selectedApp had moved on.
+  //
+  // Ids rather than row indices, for the reason defaultAppIndexForWorkspace
+  // gives at length. Cleared on every open, so a fresh overview is never
+  // wearing the last one's scrolls.
+  property var rowSelections: ({})
+
   // Current desktop background image, resolved from the same symlink the
   // background plugin follows. Refreshed each time the overview opens.
   property string backgroundImagePath: ""
+
+  readonly property string pluginDir: {
+    var url = String(Qt.resolvedUrl("."))
+    if (url.indexOf("file://") === 0) url = url.substring(7)
+    try { url = decodeURIComponent(url) } catch (e) {}
+    return url.replace(/\/+$/, "")
+  }
 
   function open(payloadJson) {
     // A workspace with no windows has no row of its own, so opening from one
@@ -60,7 +85,7 @@ Item {
     // focused window may still have changed underneath us.
     root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
     root.refreshGeometry()
-    bgPathProc.running = true
+    bgProbe.restart()
     // Whatever the last leave had got as far as, it is cancelled rather than
     // left to run: close() promises that a swipe arriving during the fade
     // brings the overview straight back, and a NumberAnimation still ticking
@@ -79,6 +104,12 @@ Item {
     // zoom-out should start from anyway.
     root.zoomProgress = 1
     root.zoomReady = false
+    root.zoomOpenAt = Date.now()
+    // And ask the compositor whether the rectangles that measuring will be
+    // done from are still the ones it is drawing the desktop from. See
+    // probeGeometry: refreshGeometry() above has asked for fresh ones, and the
+    // whole of what this waits for is that answer arriving.
+    root.probeGeometry()
     root.grabsKeyboard = true
     root.exitOpacity = 1
     // `opened` goes up before `leaving` comes down, and that order is not
@@ -86,9 +117,26 @@ Item {
     root.opened = true
     root.leaving = false
     root.gestureAxis = ""
+    // A fresh overview is never wearing the last one's scrolls, for the same
+    // reason vScroll.reset() is here: it opens on the desktop as it is.
+    root.rowSelections = ({})
     vScroll.reset()
     root.viewReset()
-    root.dbg("open focusedWs=" + (focused ? focused.id : "?")
+    // The zoom's target, ahead of the budget and ahead of everything else
+    // on screen. Every other thumbnail can wait for the rotation to reach it;
+    // this is the one the opening zoom magnifies to full size, so it is the
+    // one whose staleness would actually be legible.
+    //
+    // Asked for, not waited on. viewReset() has just refreshed any thumbnail
+    // that had no picture at all, and a target that survived the last summon
+    // still has that picture -- so the transition starts on what is already
+    // there and this arrives behind it. zoomOpener does the waiting, and only
+    // for a thumbnail that is genuinely blank.
+    root.captureTarget(root.selectedRow, root.selectedApp)
+    // Guarded rather than left to dbg()'s own test: the argument is built
+    // whether or not it is printed, and this one maps and stringifies every
+    // row in the overview on the way into the frame the open is measured from.
+    if (root.omariDebug) root.dbg("open focusedWs=" + (focused ? focused.id : "?")
       + " selectedWsId=" + root.selectedWorkspaceId
       + " selectedRow=" + root.selectedRow
       + " selectedApp=" + root.selectedApp
@@ -169,6 +217,7 @@ Item {
     geometryRefresh.stop()
     root.clearZoom()
     root.thawGeometry()
+    root.rowSelections = ({})
     vScroll.reset()
     root.viewReset()
   }
@@ -274,6 +323,26 @@ Item {
     }
   }
 
+  // The wallpaper path is resolved by a process, and a process spawn is one of
+  // the few things in here expensive enough to be worth not doing at the
+  // moment the overview opens: it is fork+exec+readlink competing for a slow
+  // machine's CPU with the two frames the opening zoom is measured from, for
+  // an answer that is the same one it gave last time on every open but the one
+  // after a theme change.
+  //
+  // So the summon starts a timer rather than the process, and the probe lands
+  // in the quiet after the zoom. The rows draw the path they already had
+  // meanwhile, which is the right one; only the first summon of a session has
+  // none, and Component.onCompleted below covers that from shell start, where
+  // there is nothing to compete with.
+  Timer {
+    id: bgProbe
+    interval: 320
+    onTriggered: bgPathProc.running = true
+  }
+
+  Component.onCompleted: bgPathProc.running = true
+
   // A workspace takes up half the screen, and that is a *ratio*, not a pixel
   // count: what the overview is for is showing how much of the workspaces
   // either side of you there is to see, and that is inherently a fraction of
@@ -291,17 +360,212 @@ Item {
   // how big a workspace is, not in absolute pixels.
   readonly property real rowSpacing: Math.round(root.rowHeight * 0.104)
 
-  // How far outside the viewport a row still counts as "on screen" for the
-  // purpose of capturing live. One row's worth of slack means a row is
-  // already streaming by the time it scrolls into view, and stops streaming
-  // well after it has left — so a scroll that hovers around a boundary never
-  // thrashes captures on and off.
-  readonly property real liveMargin: root.rowHeight
+  // How far outside the viewport a row still counts as "on screen" -- which
+  // now means "first in line for the capture budget" rather than "streaming".
+  // One row's worth of slack means a row is already being refreshed by the
+  // time it scrolls into view and stays so well after it has left, so a
+  // scroll hovering around a boundary never thrashes a thumbnail between the
+  // scheduler's on-screen rotation and its slower prefetch one.
+  //
+  // Narrowing this to a third of a row was tried and reverted. A screencopy
+  // takes a frame or two to arrive, so a margin thinner than a row starts
+  // refreshing at the moment the row appears rather than before it, and the
+  // row scrolls in showing a picture from whenever it was last on screen.
+  readonly property real nearMargin: root.rowHeight
+
+  // How far outside the viewport a row is still *drawn*. Wider than
+  // nearMargin, and the order of the two is the point: a row starts being
+  // rendered before it is close enough to be seen, so the frame that brings
+  // it on screen is never also the frame that builds its layers.
+  //
+  // Past this a row is `visible: false` rather than merely clipped away.
+  // Clipping is not free the way it looks: a row that is only scrolled off
+  // screen still keeps every one of its thumbnails' offscreen layers and its
+  // wallpaper's shadow layer allocated and up to date, and on a machine with
+  // ten workspaces that is ten screens' worth of texture the overview never
+  // shows. A workspace is half the viewport, so this keeps roughly the two
+  // rows either side of the visible pair and drops the rest.
+  //
+  // It no longer has anything to do with what captures. Being drawn used to
+  // be what re-armed a capture, so this doubled as the outer bound on
+  // screencopy traffic; captureFrame() is not paint-driven -- an undrawn view
+  // refreshes perfectly well when asked -- so the scheduler's prefetch band
+  // rides on this rather than being enforced by it. It is a texture budget
+  // now and nothing else.
+  readonly property real renderMargin: root.rowStride * 1.6
 
   // Rows are a plain uniform height — no label, no per-row chrome — which is
   // what lets every "where is row i" question in here be arithmetic rather
   // than a live geometry read off a delegate that may not exist yet.
   readonly property real rowStride: root.rowHeight + root.rowSpacing
+
+  // ---- the capture scheduler ----
+  //
+  // Every ScreencopyView in here is permanently `live: false`. This is where
+  // their frames come from instead.
+  //
+  // A live capture is not a stream the compositor pushes at us, it is a loop
+  // we hold open: each frame that arrives dirties the view, the view
+  // repaints, Quickshell re-arms the capture from updatePaintNode, and the
+  // next frame arrives to dirty it again. So a visible thumbnail renders at
+  // the display's refresh rate for as long as it is on screen, whether or not
+  // the window it shows has changed a single pixel -- and in here every one
+  // of those frames also re-renders a supersampled offscreen layer and
+  // rebuilds its mipmap chain, which for a full-screen window on this panel
+  // is a 2572x1720 texture (see captureBox). Measured: two thumbnails at
+  // overview geometry held the renderer at 66fps with the overview open,
+  // still, and untouched. The same two frozen sat at 1.2fps.
+  //
+  // What replaces it is a budget -- a fixed number of captures per second,
+  // handed to whichever thumbnail most needs one. The reason it is a budget
+  // rather than a tighter version of nearRow is that a budget's cost does not
+  // scale with how many thumbnails are on screen and live capture's does, and
+  // a machine with a lot of windows is exactly the one that cannot afford the
+  // difference.
+
+  // Captures per second, shared across the whole overview.
+  //
+  // Six is off the measured curve rather than off the feel of it: idle cost
+  // falls about linearly up to ~12/s and is indistinguishable from fully live
+  // at 30/s and above, so a faster budget pays live's price without live's
+  // freshness. At six, a screen showing six or eight thumbnails refreshes
+  // each about once a second -- invisible on a static window, alive on a
+  // terminal, a slideshow on video. That last one is the honest cost of not
+  // being live, and it is a great deal smaller than every thumbnail being
+  // frozen for as long as the overview is up.
+  readonly property real captureBudget: 6
+
+  // How long a thumbnail is left alone after a capture. Only binds when very
+  // few thumbnails are on screen -- with a normal screenful the rotation is
+  // already slower than this -- and what it prevents is the budget being
+  // spent six times a second on a single visible window.
+  readonly property int captureCooldownMs: 500
+
+  // The same, for a thumbnail inside the render margin but not yet near the
+  // viewport -- and for windows off the side of a row that is otherwise on
+  // screen. These get the budget only when nothing on screen wants it.
+  //
+  // Which, on a full screen, is rarely: six visible thumbnails against a
+  // budget of six come round about once a second each, so they are past the
+  // cooldown above whenever they are looked at and the leftovers never
+  // appear. That is deliberate rather than a shortfall. A row scrolling in
+  // still has whatever picture it had when it was last on screen -- rows are
+  // kept, not rebuilt -- and the moment it becomes near it enters the
+  // rotation with the oldest picture on screen, so it is refreshed first by
+  // the ordinary path. This tier is a bonus for a quiet overview, not a
+  // guarantee, and nothing depends on it running.
+  readonly property int capturePrefetchMs: 3000
+
+  // Deliberately a Timer, and deliberately NOT a FrameAnimation.
+  //
+  // A FrameAnimation asks the renderer for a frame on every frame -- that is
+  // the whole of what it is -- so driving this from one would pin the render
+  // loop at refresh rate and hand back none of what the scheduler exists to
+  // save. It is not a small effect and it is not theoretical: measured, a
+  // FrameAnimation issuing no captures at all cost 67fps of idle rendering,
+  // which is exactly what leaving every thumbnail live costs. A wall-clock
+  // Timer wakes the event loop and nothing else; at rest this whole mechanism
+  // measured 1.2fps.
+  //
+  // The interval is not the rate. Tokens below are what set the rate, so this
+  // can tick often enough to stay responsive to motion ending without the
+  // tick itself deciding how many captures happen.
+  Timer {
+    id: captureTick
+    interval: 100
+    repeat: true
+    running: root.opened && !root.leaving
+    onTriggered: root.captureTock()
+  }
+
+  // Never more than one, which is the whole of "no burst when motion
+  // settles": whatever the overview was doing, the frame it stops on can
+  // spend at most a single capture, and the rest arrive at the ordinary rate
+  // behind it.
+  property real captureTokens: 0
+
+  // Whether the overview is holding still enough to spend the budget.
+  //
+  // Written as a function rather than a binding on purpose. The inputs are
+  // scroll positions and delegate state, and a binding over those would
+  // re-evaluate on every pixel of every scroll -- during precisely the motion
+  // it exists to stand back from.
+  function captureQuiet() {
+    if (!root.opened || root.leaving || root.diving) return false
+    if (zoomRamp.running) return false
+    if (root.gestureMode !== "") return false
+    if (vScroll.moving) return false
+    // Any row may be gliding, not just the selected one: a row's restPosition
+    // moves when the selection inside it does, and it glides there on its own.
+    var rows = root.workspaceRows
+    for (var i = 0; i < rows.length; i++) {
+      var row = rowRepeater.itemAt(i)
+      if (row && row.renderNear && row.hScroll && row.hScroll.moving) return false
+    }
+    return true
+  }
+
+  // The thumbnail most worth spending a capture on, or null.
+  //
+  // Oldest-first rather than a cursor walked round the rows: a cursor has to
+  // survive delegates being rebuilt underneath it -- which happens every time
+  // a window opens or closes -- and picking the stalest picture is both fairer
+  // and stateless. The counts here are a handful of rows by a handful of
+  // windows, ten times a second.
+  function captureNext() {
+    var now = Date.now()
+    var rows = root.workspaceRows
+    var blank = null                       // on screen with nothing in it
+    var stale = null, staleAge = -1        // on screen, oldest picture
+    var far = null, farAge = -1            // warm for a scroll that may come
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = rowRepeater.itemAt(i)
+      if (!row || !row.renderNear) continue
+      var near = row.nearViewport
+      var apps = row.sortedToplevels
+      var n = apps ? apps.length : 0
+      for (var j = 0; j < n; j++) {
+        var t = row.thumbItemAt(j)
+        if (!t || !t.requestCapture) continue
+        var age = now - t.lastCaptureMs
+        if (near && t.nearRow) {
+          // A thumbnail with no picture is the one case worth jumping the
+          // queue for: it is drawn as a flat rectangle until it has one, and
+          // it is what zoomOpener waits on rather than uncover.
+          if (!t.hasPicture) { if (!blank) blank = t; continue }
+          if (age >= root.captureCooldownMs && age > staleAge) { staleAge = age; stale = t }
+        } else if (age >= root.capturePrefetchMs && age > farAge) {
+          farAge = age; far = t
+        }
+      }
+    }
+    return blank || stale || far
+  }
+
+  function captureTock() {
+    if (!root.captureQuiet()) return
+    root.captureTokens = Math.min(1, root.captureTokens + root.captureBudget * (captureTick.interval / 1000))
+    if (root.captureTokens < 1) return
+    var t = root.captureNext()
+    if (!t) return
+    root.captureTokens -= 1
+    t.requestCapture()
+  }
+
+  // The one capture that does not wait for the budget: whatever the overview
+  // is about to zoom into or out of.
+  //
+  // It is asked for and then not waited on. The retained picture is already
+  // there and the transition starts on it -- see zoomOpener -- so this is the
+  // fresh frame arriving a beat later into a thumbnail that was never blank,
+  // rather than a round trip anything is held up by.
+  function captureTarget(rowIndex, appIndex) {
+    var row = rowRepeater.itemAt(rowIndex)
+    if (!row) return
+    var t = row.thumbItemAt(appIndex)
+    if (t && t.requestCapture) t.requestCapture()
+  }
 
   // Only workspaces that actually have windows are worth a row; reading
   // toplevels.values here during evaluation is what keeps this reactive to
@@ -359,6 +623,9 @@ Item {
     // dive that is drawn from them. Nothing that happens after the click can
     // change what the overview is a picture of, so nothing after the click is
     // allowed to.
+    //
+    // What is held is this same array of these same rows, not a copy of it --
+    // which is the whole of what makes freezing free. See frozenRows.
     if (root.frozenRows) return root.frozenRows
     var rows = root.windowedRows.slice()
     rows.push({
@@ -393,7 +660,7 @@ Item {
 
   readonly property var selectedToplevels: {
     var ws = root.workspaceRows[root.selectedRow]
-    return ws ? root.sortToplevelsBySpatialOrder(ws.toplevels.values) : []
+    return ws ? root.sortToplevelsBySpatialOrder(root.toplevelsFor(ws)) : []
   }
 
   // Arrowing onto a row lands on whichever of its windows Hyprland would
@@ -419,14 +686,48 @@ Item {
     return 0
   }
 
+  // ---- remembering what the user scrolled a row to ----
+  //
+  // Recorded only from a deliberate move -- an arrow key, or a strip coming to
+  // rest under the fingers. Never from the automatic re-pick below, which is a
+  // *default* rather than a choice: recording that would mark every row merely
+  // passed over as changed, and commitFocusArgs would then dispatch focus at
+  // workspaces the user never touched.
+  function noteSelectedApp(index) {
+    root.selectedApp = index
+    // A fresh object rather than a write into the old one. QML compares var
+    // properties by reference, so mutating in place moves what every dependent
+    // binding would read without telling one of them to read it again -- and
+    // the whole point of this is a binding in every non-centred row.
+    var next = {}
+    for (var k in root.rowSelections) next[k] = root.rowSelections[k]
+    next[root.selectedWorkspaceId] = index
+    root.rowSelections = next
+  }
+
+  // The index the user put this workspace's row on, or -1 for "never touched".
+  function rowSelectionFor(id) {
+    var v = root.rowSelections[id]
+    return v === undefined ? -1 : v
+  }
+
   // Keyed on the workspace *id*, not on selectedRow. selectedRow is a binding
   // over workspaceRows, which Hyprland re-evaluates on every model update — a
   // window opening anywhere, or just a title changing — and any of those that
   // shifts the row index, even transiently, would fire this and silently throw
   // away a left/right selection the user had just made. The id only ever moves
   // when something actually chooses a different workspace.
-  onSelectedWorkspaceIdChanged:
-    root.selectedApp = root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
+  //
+  // Coming *back* to a row lands on where the user left it, not on Hyprland's
+  // focus there. Anything else contradicts the row itself, which has been
+  // sitting at that scroll the whole time you were away (see
+  // rowItem.selectedIndex) -- the centred row would jump on arrival.
+  onSelectedWorkspaceIdChanged: {
+    var remembered = root.rowSelectionFor(root.selectedWorkspaceId)
+    root.selectedApp = remembered >= 0
+      ? remembered
+      : root.defaultAppIndexForWorkspace(root.selectedWorkspaceId)
+  }
 
   // ---- keyboard navigation ----
   //
@@ -448,7 +749,7 @@ Item {
   function moveApp(delta) {
     var apps = root.selectedToplevels
     if (apps.length === 0) return
-    root.selectedApp = Math.max(0, Math.min(apps.length - 1, root.selectedApp + delta))
+    root.noteSelectedApp(Math.max(0, Math.min(apps.length - 1, root.selectedApp + delta)))
   }
 
   // Answers whether it found anything to activate, so a caller with a fallback
@@ -488,6 +789,112 @@ Item {
   property real zoomRealY: 0
   property bool zoomReady: true
   property var pendingActivation: null
+
+  // When the current summon started, and how long the zoom may wait for its
+  // target thumbnail to have a picture in it before opening without one.
+  //
+  // Measured rather than counted in frames on purpose: what is being waited
+  // for is a round trip to the compositor, so the budget is in milliseconds,
+  // and on a machine slow enough to matter a frame is not a fixed number of
+  // them. Long enough to cover a capture that is merely late, short enough
+  // that a capture which is never coming does not hold the overview shut.
+  property real zoomOpenAt: 0
+  readonly property int zoomWaitMs: 220
+
+  // The budget for the other round trip an open waits on; see probeGeometry.
+  // A tenth of what that one costs, because it is a different kind of wait: a
+  // screencopy that is late is late for reasons out here, while this is a
+  // socket round trip measured in single-digit milliseconds against a
+  // compositor that is by definition answering. What it really guards against
+  // is the two ends never agreeing at all -- some future rounding that makes
+  // the comparison in geometryIsCurrent permanently false -- and there the
+  // whole point is that it costs a few frames of desktop rather than a fifth
+  // of a second of one.
+  readonly property int geometryWaitMs: 80
+
+  // ---- is the picture current? ----
+  //
+  // Whether the rectangles the overview draws itself from describe the layout
+  // Hyprland has now, or the one it had the last time anything asked.
+  //
+  // Nothing moves a window in Quickshell's model on its own: lastIpcObject is
+  // filled in by an IPC query and by nothing else (see refreshGeometry), and a
+  // scrolling layout scrolls the whole workspace every time the focus moves
+  // between columns -- with nothing on the event socket to say so, because no
+  // window has been opened, closed, or moved between workspaces. The tape has
+  // simply been drawn somewhere else. So by the time the overview is summoned,
+  // the layout it holds can be several focus changes out of date, and the
+  // further the tape has run since, the further out it is.
+  //
+  // open() asks for it again, and that answer used to be safe to assume was in
+  // hand by the time anything read it: the query was written when a summon
+  // spent ~200ms per frame mapping its layer surface, which is a very long
+  // time for a reply that takes one or two milliseconds. The surface stays
+  // mapped now and the zoom is measured on the first frame the renderer
+  // produces (see zoomOpener), so the reply and that frame are in a race -- and
+  // on the frames it loses, everything the zoom is built from is measured off
+  // the old layout: the strip is drawn where the workspace used to be, and the
+  // window the zoom is anchored on is aimed at where that window used to be.
+  // The overview then falls back out of a picture of the desktop that is a
+  // whole scroll out of register with the desktop underneath it, which reads
+  // exactly as what it is -- the zoom pivoting on some other window, generally
+  // the one now standing where the focused one stood before.
+  //
+  // It is the same trap the dive walks around by asking Hyprland where the
+  // window went (see aimZoom) instead of trusting what it has, and the answer
+  // is put to the same use: not drawn from -- the rows draw from Quickshell's
+  // model and only it -- but compared against. Hyprland describing the focused
+  // window exactly as the model already has it is that model's refresh having
+  // landed.
+  property bool geometryLanded: true
+
+  function probeGeometry() {
+    root.geometryLanded = false
+    root.hyprSend("j/activewindow", "open")
+  }
+
+  // One window, because one query answers for all of them: the refresh asked
+  // for above is a single request for every client, whose reply writes the
+  // whole model at once, so one rectangle that agrees is that reply having
+  // been processed.
+  function geometryIsCurrent(win) {
+    var top = Hyprland.activeToplevel
+    // Nothing to compare against is not a reason to hold the overview shut: an
+    // empty workspace has no focused window, and a reply that would not parse
+    // is an answer that is not coming.
+    if (!win || !win.address || !top) return true
+    var ipc = top.lastIpcObject
+    if (!ipc || !ipc.address || String(ipc.address) !== String(win.address)) return false
+    var real = root.rectFromIpc(win)
+    var cached = root.liveRectFor(top)
+    if (!real || !cached) return true
+    return Math.abs(cached.x - real.x) < 0.5 && Math.abs(cached.y - real.y) < 0.5
+      && Math.abs(cached.w - real.w) < 0.5 && Math.abs(cached.h - real.h) < 0.5
+  }
+
+  function openProbeLanded(reply) {
+    if (!root.opened || root.geometryLanded) return
+    var current = root.geometryIsCurrent(root.parseWindow(reply))
+    // And bounded, for the same reason the paint wait is: an overview that
+    // cannot be shown the current layout has to open on the layout it has
+    // rather than not open. See geometryWaitMs for why this one's budget is
+    // the smaller of the two.
+    if (current || Date.now() - root.zoomOpenAt >= root.geometryWaitMs) {
+      root.geometryLanded = true
+      root.dbg("geometry " + (current ? "landed" : "GAVE UP") + " after "
+        + Math.round(Date.now() - root.zoomOpenAt) + "ms")
+      return
+    }
+    geometryProbeRetry.restart()
+  }
+
+  // Ask again rather than sit on an answer that says the model has not caught
+  // up yet. Same interval as aimRetry, for the same reason it has one.
+  Timer {
+    id: geometryProbeRetry
+    interval: 8
+    onTriggered: if (root.opened && !root.geometryLanded) root.probeGeometry()
+  }
 
   // Where the overlay's own top-left sits on the monitor, which since the
   // surface started respecting exclusion zones is no longer the monitor's
@@ -568,6 +975,48 @@ Item {
 
   readonly property real zoomFactor: 1 + root.zoomProgress * (root.zoomScale - 1)
 
+  // ---- the row's shift, and the rate the zoom already assumes for it ----
+  //
+  // How much of the row's own scroll has been performed at this progress, as a
+  // fraction of it. See aimZoom for what that scroll is, and rowItem.diveShift
+  // for where it is applied.
+  //
+  // It used to be the progress itself, and that is the whole of a dive out of a
+  // scrolled row looking like a zoom anchored on some other window.
+  //
+  // The two halves of the dive disagreed about *when* the shift happens. The
+  // row performs it in row pixels: rowContent slides by shift x progress, which
+  // on screen is that again multiplied by the zoom factor, so it starts slowly
+  // and accelerates as the strip grows. The transform's compensation for it is
+  // not a matching curve -- it is a single number, the thumbnail's position at
+  // the end of the dive (aimZoom moves the capture there), which zoomOffset
+  // ramps linearly. So the offset carries the shift at a constant rate in
+  // screen pixels while the row delivers it at an accelerating one, and the
+  // difference between them, in screen pixels, is
+  //
+  //     shift x progress x (zoomScale - zoomFactor)
+  //
+  // which is zero at both ends of the ramp and largest in the middle -- three
+  // quarters of the whole shift, at a quarter-size thumbnail. The endpoints
+  // being exact is why this was never a dive that landed wrong: the window
+  // arrived precisely where it belonged, having swung most of a screen's width
+  // sideways and back on the way. That swing is the "wrong pivot", and it grows
+  // with the shift, which is why it takes scrolling a row away from its
+  // workspace's own position before diving out of it to see.
+  //
+  // Dividing the factor back out is what makes the row's slide linear in screen
+  // pixels too -- constant velocity, the same thing every other term in the
+  // transform travels at. The zoomScale factor renormalises it so progress 1
+  // still performs the whole shift, which every endpoint here depends on, and
+  // it stays monotonic in progress for any scale above zero, so the row never
+  // backs up.
+  readonly property real diveShiftPhase: root.zoomFactor > 0
+    ? root.zoomProgress * root.zoomScale / root.zoomFactor
+    : root.zoomProgress
+
+  // The shift as the row is drawing it right now, in row pixels.
+  readonly property real diveShiftNow: root.diveShiftPx * root.diveShiftPhase
+
   // ---- the backdrop's own curve ----
   //
   // The two directions of the zoom want opposite things from the backdrop, and
@@ -600,13 +1049,38 @@ Item {
   // clearZoom, and for nothing else.
   readonly property bool diving: root.pendingActivation !== null
 
-  readonly property real backdropOpacity: root.diving
-    ? 1 - root.zoomProgress * root.zoomProgress
-    : Math.min(1, (1 - root.zoomProgress) / root.backdropRise)
+  // Nothing at all until the strip is showing, and that leading term is not a
+  // refinement of the curve below -- it is the whole of the grey flash on an
+  // opening swipe.
+  //
+  // The strip is held invisible until zoomReady (see zoomLayer.opacity), and
+  // an opening swipe writes zoomProgress from the fingers from the very first
+  // event, before the surface has been drawn once. backdropRise is a tenth, so
+  // some thirty pixels of finger travel took this to fully opaque -- and with
+  // the strip not yet drawing, fully opaque is a flat mid grey over the whole
+  // screen with nothing on it. That is the grey flash, and it got wider the
+  // longer the first frame took, which is to say it was worst on exactly the
+  // machines that could least afford it.
+  //
+  // Held at zero instead, an open that is not ready yet shows the real desktop
+  // through a transparent overlay -- which is what the frame before the swipe
+  // showed, and the frame the zoom is supposed to start from anyway.
+  readonly property real backdropOpacity: !root.zoomReady
+    ? 0
+    : root.diving
+      ? 1 - root.zoomProgress * root.zoomProgress
+      : Math.min(1, (1 - root.zoomProgress) / root.backdropRise)
 
   // Ramping the scale alone would drag the target away from both endpoints in
   // between; this holds its top-left on the straight line from thumbnail to
   // real window for the whole ramp.
+  //
+  // Straight line including the row's own scroll, which is worth saying
+  // because it is not obvious from here: the term this subtracts is the
+  // thumbnail's position at the *end* of the dive (aimZoom moves the capture
+  // there), so the offset is already carrying the whole of the row's shift, at
+  // a rate linear in progress and therefore in screen pixels. What the row
+  // performs has to match that. See diveShiftPhase.
   function zoomOffset(thumbPos, realPos) {
     return thumbPos + (realPos - thumbPos) * root.zoomProgress
       - root.zoomFactor * thumbPos
@@ -616,12 +1090,13 @@ Item {
   // layout from the model, so it stays correct when a row has been scrolled
   // away from its resting position.
   //
-  // Must be called BEFORE freezeGeometry, and that ordering is the whole of a
-  // dive landing on the row it was aimed at. The freeze hands the Repeater a
-  // fresh array (see frozenRows), which rebuilds every row delegate -- and a
-  // delegate that has just been created has not been positioned by its Column
-  // yet, so it sits at y 0 whatever its index. Measuring there returned the
-  // *first* row's place for whichever row was actually being dived into:
+  // Must be called BEFORE freezeGeometry. The freeze used to hand the Repeater
+  // a fresh array of snapshot rows (see freezeToplevels), which rebuilt every
+  // row delegate, and a delegate that has just been created used to sit at y 0
+  // whatever its index:
+  // a Column positions its children in a later pass, so measuring inside the
+  // same statement returned the *first* row's place for whichever row was
+  // actually being dived into:
   //
   //   probe BEFORE freeze rowY=503 thumbAt=348,251
   //   probe AFTER  freeze rowY=0   thumbAt=348,-252
@@ -631,11 +1106,19 @@ Item {
   // workspace filling the screen -- and only a dive from row 0 was ever right,
   // because there the stale position and the real one are the same number.
   //
-  // Nothing else the freeze does disturbs the measurement: it stops the
+  // Both halves of that trap are sprung now. A row's y is a plain binding on
+  // its own index rather than a positioner's output (see the Item that replaced
+  // the Column), so it is right from the instant a delegate is created -- and
+  // the freeze no longer creates any, since it holds the row list it was
+  // already answering with instead of a copy of it. The ordering stays as it
+  // is regardless: measuring the picture before pinning it is the statement
+  // being made, and there is nothing to be gained by making it the other way
+  // round.
+  //
+  // Nothing else the freeze does disturbs the measurement either: it stops the
   // scrollers rather than moving them, and the strips keep their positions
-  // across the rebuild (hPos and stripOffset are unchanged above), so a
-  // capture taken a statement earlier describes the same picture the freeze
-  // then pins.
+  // (hPos and stripOffset are unchanged above), so a capture taken a statement
+  // earlier describes the same picture the freeze then pins.
   function captureZoom(rowIndex, appIndex) {
     var row = rowRepeater.itemAt(rowIndex)
     if (!row) { root.dbg("captureZoom: no row delegate at " + rowIndex); return false }
@@ -660,10 +1143,22 @@ Item {
     return true
   }
 
+  // Whether the thumbnail the zoom is anchored on has a frame in it yet.
+  // Missing delegates answer false: there is nothing to wait for that the
+  // deadline in zoomOpener will not resolve on its own.
+  function zoomTargetPainted() {
+    var row = rowRepeater.itemAt(root.selectedRow)
+    if (!row) return false
+    var item = row.thumbItemAt(root.selectedApp)
+    return !!item && item.hasPicture
+  }
+
   function clearZoom() {
     zoomRamp.halt()
     diveDeadline.stop()
     aimRetry.stop()
+    geometryProbeRetry.stop()
+    root.geometryLanded = true
     root.aimRetries = 0
     root.pendingDispatch = ""
     restoreFallback.stop()
@@ -721,6 +1216,17 @@ Item {
       root.focusToplevel(toplevel)
       return
     }
+    // The dive's target, one fresh frame, now -- and then nothing more until
+    // the overview is back. captureQuiet() refuses while root.diving, so this
+    // is the last capture this thumbnail takes before it is magnified to full
+    // size, and the dive runs on it frozen.
+    //
+    // The timing is better than it looks. The dispatch goes out before a
+    // pixel of the dive is drawn and the overview then stands still for a
+    // couple of frames under an opaque backdrop waiting for Hyprland to
+    // answer -- so the frame asked for here lands during those, which is the
+    // least visible moment in the whole transition rather than the most.
+    root.captureTarget(rowIndex, appIndex)
     root.freezeGeometry()
     var tFreeze = Date.now()
     root.dbg("phases focusArg=" + (tArg - root.dbgClickMs) + "ms capture="
@@ -757,6 +1263,8 @@ Item {
   property string hyprRequest: ""
   property string hyprReply: ""
   property bool hyprPending: false
+  // Which of the two askers the answer in flight belongs to; see hyprSend.
+  property string hyprReplyTo: "dive"
 
   Socket {
     id: hyprIpc
@@ -785,13 +1293,27 @@ Item {
       if (!root.hyprPending) return
       root.hyprPending = false
       root.dbg("socket reply at " + (Date.now() - root.dbgClickMs) + "ms, "
-        + root.hyprReply.length + " bytes")
-      root.beginDive(root.hyprReply)
+        + root.hyprReply.length + " bytes for " + root.hyprReplyTo)
+      if (root.hyprReplyTo === "open") root.openProbeLanded(root.hyprReply)
+      else root.beginDive(root.hyprReply)
     }
     onError: function(err) { root.dbg("socket error " + err) }
   }
 
-  function hyprSend(request) {
+  // `replyTo` names what the answer is for, because there are two things it can
+  // be for now and the socket carries one at a time. Defaulted rather than
+  // required: everything that does not say is the dive, which is everything
+  // that ever sent on this socket before the open began asking too.
+  function hyprSend(request, replyTo) {
+    root.hyprReplyTo = replyTo || "dive"
+    if (root.hyprReplyTo === "dive") {
+      // A dive has started, and it both owns the socket and answers the
+      // question the open was still asking -- it measures the layout its own
+      // dispatch produced, which is a later answer than any the probe could
+      // bring back. So the open stops waiting for one.
+      geometryProbeRetry.stop()
+      root.geometryLanded = true
+    }
     root.dbg("hyprSend at " + (Date.now() - root.dbgClickMs) + "ms REQ="
       + JSON.stringify(request))
     root.hyprRequest = request
@@ -816,8 +1338,17 @@ Item {
   // and moving nothing -- but that was the focus restore described at
   // pendingDispatch overwriting a dispatch that had in fact landed. Sent after
   // the restore instead, it lands and stays, and the aim comes back with it.
-  function dispatchAndAim(arg) {
-    root.hyprSend("[[BATCH]]dispatch " + arg + ";j/activewindow")
+  function dispatchAndAim(pre, arg) {
+    root.hyprSend("[[BATCH]]" + root.dispatchChain(pre.concat([arg])) + ";j/activewindow")
+  }
+
+  // One `dispatch` per argument, joined by the batch separator. Hyprland runs
+  // them in the order given, so the last one is the one that decides where
+  // focus and the active workspace end up; everything before it is passed
+  // through. Nothing a focus argument contains is a `;` (see focusArg), so the
+  // separator is unambiguous.
+  function dispatchChain(args) {
+    return args.map(function(a) { return "dispatch " + a }).join(";")
   }
 
   // Whether an answer describes some window other than the one that was
@@ -1038,11 +1569,41 @@ Item {
     id: zoomOpener
     running: root.opened && !root.zoomReady
     onTriggered: {
-      root.dbg("zoomOpener frame: selectedRow=" + root.selectedRow
+      // Built only when it is wanted; see open(). This one runs on the first
+      // frame of every summon, which is the frame with the least to spare.
+      if (root.omariDebug) root.dbg("zoomOpener frame: selectedRow=" + root.selectedRow
         + " selectedApp=" + root.selectedApp
         + " rows=" + JSON.stringify(root.workspaceRows.map(function(r) { return r.id }))
         + " gestureActive=" + root.gestureActive)
       if (root.captureZoom(root.selectedRow, root.selectedApp)) {
+        // Geometry is not a picture. captureZoom answers as soon as the
+        // delegate has been laid out, which is a frame or more before its
+        // screencopy has arrived -- and uncovering there hands the zoom a
+        // thumbnail with nothing in it, blown up over the whole screen. That
+        // is a flat Color.background rectangle with the backdrop's grey around
+        // it, held for as long as the capture takes, and it is the same defect
+        // as the backdrop flash seen one layer further in.
+        //
+        // So the measurement is kept -- it is re-taken every frame anyway and
+        // stays current while we wait -- and the uncovering waits. Until it
+        // happens the backdrop is transparent and the strip is invisible, so
+        // what is on screen is the real desktop, still, which is what the
+        // fingers started the swipe on.
+        //
+        // Geometry is not a picture either, and it is the other half of the
+        // same statement: a measurement taken off a layout the compositor has
+        // already scrolled away from is a zoom anchored on where the window
+        // used to be. That one is waited on here rather than in the capture
+        // because it is the *uncovering* both of them are about -- see
+        // probeGeometry, which is what geometryLanded is the answer to.
+        //
+        // The deadline is the important half of both: a window the compositor
+        // will never hand over, or a layout it will never describe, must open
+        // the overview *without* a zoom rather than hold it shut, so a stream
+        // or a socket that has died takes an extra fifth of a second and
+        // nothing worse.
+        if (!(root.geometryLanded && root.zoomTargetPainted())
+            && Date.now() - root.zoomOpenAt < root.zoomWaitMs) return
         root.dbg("zoomOpener captured thumb=("
           + Math.round(root.zoomThumbX) + "," + Math.round(root.zoomThumbY)
           + ") real=(" + Math.round(root.zoomRealX) + "," + Math.round(root.zoomRealY)
@@ -1729,10 +2290,22 @@ Item {
     return r ? r.x : Number.MAX_SAFE_INTEGER
   }
 
+  // Decorated rather than sorted through spatialXFor directly. Every call of
+  // that walks rectFor, which allocates a fresh rectangle, and a comparator
+  // runs O(n log n) times against O(n) windows -- so the naive version
+  // measured each window's position several times over and threw all but one
+  // of the answers away. This asks once per window. It is the same order, and
+  // it is re-derived every time Hyprland answers a geometry query with the
+  // overview up, per row.
   function sortToplevelsBySpatialOrder(values) {
-    var arr = values ? values.slice() : []
-    arr.sort(function(a, b) { return root.spatialXFor(a) - root.spatialXFor(b) })
-    return arr
+    var n = values ? values.length : 0
+    if (n < 2) return values ? values.slice() : []
+    var keyed = new Array(n)
+    for (var i = 0; i < n; i++) keyed[i] = { t: values[i], x: root.spatialXFor(values[i]) }
+    keyed.sort(function(a, b) { return a.x - b.x })
+    var out = new Array(n)
+    for (var j = 0; j < n; j++) out[j] = keyed[j].t
+    return out
   }
 
   // What everything the overview *draws* asks. Answers with the frozen
@@ -1796,34 +2369,61 @@ Item {
   property var frozenRows: null
   property var frozenFocus: null
 
+  // Each frozen row's windows, keyed by workspace id. The list of rows is
+  // pinned by holding the array; the lists *inside* the rows cannot be, since
+  // they belong to Hyprland -- see freezeToplevels.
+  property var frozenToplevels: null
+
   // Whether the picture is pinned. The scrollers bind their own `frozen` to
   // this rather than being told once, so nothing that arrives later can start
   // them moving again -- see KineticScroll.
   readonly property bool viewIsFrozen: root.frozenRects !== null
 
-  // A row list that answers the three questions the delegates ask -- `id`,
-  // `monitor`, `toplevels.values` -- out of plain snapshots rather than out of
-  // live Hyprland objects.
+  // Each row's window list as it stands right now, keyed by workspace id.
   //
-  // Holding root.workspaceRows itself was not enough. The *list* stopped being
-  // rebuilt, but the entries in it were the real HyprlandWorkspace objects,
-  // and `toplevels.values` on one of those is as live as anything else here:
-  // the focus dispatch moves the active workspace, Quickshell rebuilds that
-  // model, and a row silently gained or lost a window mid-dive -- which
-  // re-runs the Repeater over it and re-lays out every thumbnail beside it.
-  function snapshotRows(rows) {
-    var out = []
+  // Holding root.workspaceRows is enough to pin the rows themselves, but not
+  // what is in them: the entries are real HyprlandWorkspace objects, and
+  // `toplevels.values` on one of those is as live as anything else here -- the
+  // focus dispatch moves the active workspace, Quickshell rebuilds that model,
+  // and a row silently gains or loses a window mid-dive, which re-runs the
+  // Repeater over it and re-lays out every thumbnail beside it.
+  //
+  // This used to be done by replacing the rows with plain snapshot objects,
+  // and that cost the overview every picture in it. A Repeater rebuilds when
+  // its model is a *different* list and it compares by value, so an array of
+  // the same workspace objects in the same order is the same list however many
+  // times the binding re-runs -- which is what lets the live model be
+  // re-evaluated on every geometry event for nothing. An array of freshly
+  // built snapshot objects is a different list every time. So the freeze threw
+  // away every row delegate, the thaw threw them away again, and each of those
+  // took every ScreencopyView in the overview with it: thumbnails back to bare
+  // grey at the first frame of the dive, and again on the summon after it,
+  // since the thaw in finish() rebuilds them with the overview down and
+  // nothing drawing to re-arm a capture. That is the flash.
+  //
+  // Freezing the window lists on their own leaves the row objects, and so the
+  // model, untouched.
+  function freezeToplevels(rows) {
+    var out = ({})
     for (var i = 0; i < rows.length; i++) {
       var row = rows[i]
-      var vals = (row && row.toplevels) ? row.toplevels.values : []
-      out.push({
-        id: row.id,
-        omariEmpty: !!row.omariEmpty,
-        monitor: row.monitor,
-        toplevels: { values: vals.slice() }
-      })
+      if (!row) continue
+      out[row.id] = (row.toplevels ? row.toplevels.values.slice() : [])
     }
     return out
+  }
+
+  // What everything that draws a row asks for its windows, and rectFor's
+  // counterpart in every way: pinned once the dive has started, live until
+  // then. Answers with the same toplevel objects either side of the freeze,
+  // which is what keeps the thumbnail Repeaters from rebuilding across it.
+  function toplevelsFor(row) {
+    if (!row) return []
+    if (root.frozenToplevels) {
+      var frozen = root.frozenToplevels[row.id]
+      if (frozen) return frozen
+    }
+    return row.toplevels ? row.toplevels.values : []
   }
 
   function freezeGeometry() {
@@ -1843,14 +2443,16 @@ Item {
         if (isFinite(h)) focus[ipc.address] = h
       }
     }
-    // All three are handed the value the live binding is answering with right
+    // All four are handed the value the live binding is answering with right
     // now, so raising the flags changes nothing that is on screen: the freeze
     // is invisible going in, and only shows up as the things that stop
-    // happening after it. Rows last, since snapshotRows sorts through
-    // rectFor and wants the rectangles already pinned when it does.
+    // happening after it. Rows last, and by reference -- the list handed over
+    // is the one workspaceRows was already answering with, so the Repeater
+    // over it sees no change at all and not one delegate is rebuilt.
     root.frozenFocus = focus
     root.frozenRects = frozen
-    root.frozenRows = root.snapshotRows(root.workspaceRows)
+    root.frozenToplevels = root.freezeToplevels(root.workspaceRows)
+    root.frozenRows = root.workspaceRows.slice()
     // The rectangles are only half of it: a strip still coasting from a flick,
     // or gliding towards a rest position, moves under the zoom just as surely
     // as a re-layout would.
@@ -1861,6 +2463,7 @@ Item {
   function thawGeometry() {
     root.frozenRects = null
     root.frozenRows = null
+    root.frozenToplevels = null
     root.frozenFocus = null
   }
 
@@ -1976,7 +2579,17 @@ Item {
     var arg = root.pendingDispatch
     root.pendingDispatch = ""
     restoreFallback.stop()
-    root.dbg("dispatch after restore at " + (Date.now() - root.dbgClickMs) + "ms")
+    // Every row the user scrolled goes out in front of the destination, in the
+    // same batch, so leaving the overview leaves the workspaces arranged the
+    // way it was showing them. Cleared here rather than at the end of the
+    // leave: this is the moment they stop being pending and start being true,
+    // and a gesture dive that is pushed back up after this point should find
+    // its rows agreeing with the compositor rather than asking for the same
+    // dispatches a second time. See commitFocusArgs.
+    var pre = root.commitFocusArgs()
+    root.rowSelections = ({})
+    root.dbg("dispatch after restore at " + (Date.now() - root.dbgClickMs) + "ms"
+      + (pre.length > 0 ? " with " + pre.length + " row commit(s)" : ""))
     // A dive needs the reply as much as it needs the dispatch, so it takes the
     // longer way round; everything else fires and forgets. The un-dived
     // hand-off starts holding still for the switch from here too, since here
@@ -1984,8 +2597,13 @@ Item {
     if (root.awaitingLanding) {
       // From here, and not from the click: see diveDeadline.
       diveDeadline.restart()
-      root.dispatchAndAim(arg)
-    } else { root.hyprSend("dispatch " + arg); switchHold.restart() }
+      root.dispatchAndAim(pre, arg)
+    } else {
+      root.hyprSend(pre.length > 0
+        ? "[[BATCH]]" + root.dispatchChain(pre.concat([arg]))
+        : "dispatch " + arg)
+      switchHold.restart()
+    }
   }
 
   // A hand-off with no dive behind it: the empty row, or a window whose
@@ -2025,6 +2643,48 @@ Item {
     var ipc = hyprlandToplevel && hyprlandToplevel.lastIpcObject
     var address = ipc ? ipc.address : undefined
     return address ? "hl.dsp.focus({ window = 'address:" + address + "' })" : ""
+  }
+
+  // The rows the user scrolled, as focus dispatches, for the batch that leaves
+  // the overview -- everything except the row being left on, which is the
+  // destination dispatch those go in front of.
+  //
+  // A scrolling layout has no dispatcher for "scroll this workspace to here"
+  // (the same wall rowScroll.onSettled runs into): the only way to put a
+  // workspace where the overview is showing it is to focus the window the
+  // overview has ringed there, and Hyprland focuses a window by going to it.
+  // So each of these switches the active workspace as it runs, which is
+  // exactly why they go first and the destination goes last -- the batch runs
+  // in order inside the compositor and the last dispatch is the one that
+  // decides where you come out. All of it happens in the one round trip that
+  // was already being made, behind a backdrop that is already opaque.
+  //
+  // A row whose remembered index is what Hyprland has focused there anyway is
+  // dropped: the scroll it asks for has already happened, and dispatching it
+  // would move that window up the focus history (see focusedIndexFor) for
+  // nothing. An overview that was only looked at therefore sends nothing extra
+  // and this costs nothing at all.
+  function commitFocusArgs() {
+    var args = []
+    var rows = root.windowedRows
+    for (var i = 0; i < rows.length; i++) {
+      var want = root.rowSelectionFor(rows[i].id)
+      if (want < 0) continue
+      var apps = root.sortToplevelsBySpatialOrder(rows[i].toplevels.values)
+      if (apps.length === 0) continue
+      // The row being left on is skipped both ways it can be identified: it is
+      // the centred one for everything that leaves by the selection, and it is
+      // whichever row holds the clicked window for a click, which can land on
+      // a row that was never centred at all. Either way its scroll is the
+      // destination dispatch's own business and that one goes last.
+      if (rows[i].id === root.selectedWorkspaceId) continue
+      if (root.pendingActivation && apps.indexOf(root.pendingActivation) >= 0) continue
+      want = Math.max(0, Math.min(apps.length - 1, want))
+      if (want === root.focusedIndexFor(apps)) continue
+      var arg = root.focusArg(apps[want])
+      if (arg) args.push(arg)
+    }
+    return args
   }
 
   function focusToplevel(hyprlandToplevel) {
@@ -2238,6 +2898,12 @@ Item {
       Item {
         id: viewport
         anchors.fill: parent
+
+        // Asked once for the whole overview rather than through a Screen
+        // attachment per thumbnail and per row. Every texture size in here is
+        // in device pixels and every one of them used to instantiate its own
+        // attached object to find that out.
+        readonly property real dpr: Screen.devicePixelRatio
         // No margin: the rows above and below the centred one are meant to
         // run off the top and bottom edges of the screen. Insetting the
         // viewport instead frames them inside a backdrop border, which reads
@@ -2273,10 +2939,12 @@ Item {
           snapStride: root.rowStride
           restPosition: viewport.centerPositionFor(root.selectedRow)
           frozen: root.viewIsFrozen
-          // Undoes Hyprland's global touchpad scroll_factor (Omarchy
-          // default 0.4) -- see the property's own comment in
-          // KineticScroll.qml.
-          dragScale: 4
+          // Exactly undoes Hyprland's global touchpad scroll_factor
+          // (Omarchy default 0.4), so the content tracks raw finger travel
+          // 1:1 -- see the property's own comment in KineticScroll.qml. The
+          // previous 4 over-corrected to 1.6x, which is what made the pad
+          // read as twitchy: a small flick crossed several rows.
+          dragScale: 2.5
 
           // A swipe or a wheel step settling on a row *is* selecting it, so
           // the selection follows the scroll as well as driving it.
@@ -2307,10 +2975,20 @@ Item {
           y: root.zoomOffset(root.zoomThumbY, root.zoomRealY)
           opacity: root.zoomReady ? 1 : 0
 
-        Column {
+        // A plain Item, not a Column, and the rows place themselves at
+        // index * rowStride inside it. Rows are a uniform height, so a
+        // positioner was computing a number the rest of the file already
+        // derives arithmetically -- viewport.centerPositionFor, the snap
+        // points, rowItem.viewportY are all `index * rowStride` and always
+        // were. What the positioner cost was the one thing that mattered: a
+        // Column lays out only its *visible* children and closes the gap left
+        // by an invisible one, so with it there no row could be dropped from
+        // the scene without every row below it sliding up a slot. See
+        // rowItem.renderNear, which is what that buys.
+        Item {
           id: column
           width: viewport.width
-          spacing: root.rowSpacing
+          height: root.workspaceRows.length * root.rowStride
           y: viewport.columnOffset
 
           Repeater {
@@ -2323,6 +3001,7 @@ Item {
               required property int index
               width: column.width
               height: root.rowHeight
+              y: rowItem.index * root.rowStride
 
               // How root.selectedRowScroll() reaches this row's horizontal axis.
               property alias hScroll: rowScroll
@@ -2330,7 +3009,7 @@ Item {
               // Windows in real on-screen (left-to-right) order, so the
               // thumbnails either side of the focused one match how the
               // actual windows are laid out on the workspace.
-              readonly property var sortedToplevels: root.sortToplevelsBySpatialOrder(rowItem.modelData.toplevels.values)
+              readonly property var sortedToplevels: root.sortToplevelsBySpatialOrder(root.toplevelsFor(rowItem.modelData))
               readonly property int focusedIndex: root.focusedIndexFor(rowItem.sortedToplevels)
 
               readonly property bool current: rowItem.index === root.selectedRow
@@ -2341,14 +3020,28 @@ Item {
               // and a click target of its own instead of thumbnails.
               readonly property bool isEmptyRow: root.isEmptyRowModel(rowItem.modelData)
 
-              // Which thumbnail this row centres on. Only the centred row
-              // follows the live left/right selection; every other row stays
-              // parked on whatever Hyprland considers focused there, so
-              // arrowing onto it lands somewhere sensible rather than
-              // wherever the last row happened to be scrolled to.
-              readonly property int selectedIndex: rowItem.current
-                ? Math.max(0, Math.min(rowItem.sortedToplevels.length - 1, root.selectedApp))
-                : rowItem.focusedIndex
+              // Which thumbnail this row centres on, and so -- through restX --
+              // where its strip comes to rest.
+              //
+              // The centred row follows the live left/right selection. Every
+              // other row follows what the user last scrolled *it* to, and
+              // falls back to whatever Hyprland considers focused there only
+              // if the user never touched it: an untouched row should show the
+              // workspace as it really is, so arrowing onto it lands somewhere
+              // sensible; a touched one should stay where it was put. Reading
+              // Hyprland's focus in both cases is what used to snap a row back
+              // to its original scroll the instant you moved off it -- see
+              // root.rowSelections.
+              readonly property int selectedIndex: {
+                var n = rowItem.sortedToplevels.length
+                if (rowItem.current)
+                  return Math.max(0, Math.min(n - 1, root.selectedApp))
+                var remembered = rowItem.modelData
+                  ? root.rowSelectionFor(rowItem.modelData.id)
+                  : -1
+                if (remembered < 0) return rowItem.focusedIndex
+                return Math.max(0, Math.min(n - 1, remembered))
+              }
 
               // This row's top edge in viewport coordinates, and whether
               // that puts it close enough to matter. Rows are a uniform
@@ -2358,7 +3051,7 @@ Item {
               // the one being dived into, and zero at both ends of every other
               // zoom. See root.aimZoom.
               readonly property real diveShift: rowItem.index === root.diveRow
-                ? root.diveShiftPx * root.zoomProgress
+                ? root.diveShiftNow
                 : 0
 
               // How far this row's strip stands from the position that draws
@@ -2380,8 +3073,36 @@ Item {
               // rows, and a row that decides it is off-screen halfway through
               // one drops the thumbnail being dived into.
               readonly property bool nearViewport: root.surfaceLive
-                && rowItem.viewportY + root.rowHeight > -root.liveMargin
-                && rowItem.viewportY < viewport.height + root.liveMargin
+                && rowItem.viewportY + root.rowHeight > -root.nearMargin
+                && rowItem.viewportY < viewport.height + root.nearMargin
+
+              // Whether this row is drawn at all. A row scrolled well clear of
+              // the viewport is clipped away either way, but a clipped row is
+              // still a row: its wallpaper's shadow layer and every one of its
+              // thumbnails' supersampled, mipmapped layers stay allocated and
+              // stay up to date, and on a ten-workspace machine that is most
+              // of the overview's texture footprint spent on rows nobody can
+              // see. `visible: false` takes the whole subtree out of the scene
+              // graph instead.
+              //
+              // Deliberately NOT gated on surfaceLive, unlike nearViewport.
+              // The surface is never unmapped and its children are already
+              // held invisible while the overview is down (see the backdrop's
+              // own `visible`), so folding that in here would change nothing
+              // on screen -- and would cost the reopen every layer this drops,
+              // rebuilt on the first frame of the summon, which is the frame
+              // the whole opening zoom is measured from.
+              readonly property bool renderNear:
+                rowItem.viewportY + root.rowHeight > -root.renderMargin
+                && rowItem.viewportY < viewport.height + root.renderMargin
+
+              // Nothing below this line exists as far as the renderer is
+              // concerned for a row that is far enough away. The row Item
+              // itself keeps its place and its height -- everything that
+              // counts, centres or snaps rows is arithmetic over the index,
+              // and captureZoom's mapToItem is a transform walk, so all of it
+              // still answers for a row that is not being drawn.
+              visible: rowItem.renderNear
 
               // ---- the workspace's real geometry ----
               //
@@ -2602,7 +3323,7 @@ Item {
                   // and a full-size decode otherwise, for something drawn a few
                   // hundred pixels tall. Every row asks for the same height, so
                   // they all share one cached texture.
-                  sourceSize.height: Math.round(root.rowHeight * Screen.devicePixelRatio)
+                  sourceSize.height: Math.round(root.rowHeight * viewport.dpr)
                 }
               }
 
@@ -2704,10 +3425,16 @@ Item {
                   restPosition: rowViewport.restX
                   frozen: root.viewIsFrozen
                   notchPixels: root.rowHeight * 0.6
-                  // Undoes Hyprland's global touchpad scroll_factor (Omarchy
-                  // default 0.4) -- see the property's own comment in
-                  // KineticScroll.qml.
-                  dragScale: 4
+                  // Shorter coast than the component default. This is the
+                  // only axis that ever runs momentum at all -- vScroll
+                  // snaps, so its release goes straight to a glide -- and a
+                  // strip of windows is a short travel to begin with, so a
+                  // coast tuned for a long list overshot the window you
+                  // flicked toward and kept sliding after you were done.
+                  momentumTau: 0.45
+                  // Exactly undoes Hyprland's global touchpad scroll_factor
+                  // (Omarchy default 0.4) -- see vScroll.dragScale above.
+                  dragScale: 2.5
 
                   // Scrolling a row sideways selects, exactly as scrolling the
                   // workspace list vertically does (see vScroll.onSnapped).
@@ -2727,7 +3454,11 @@ Item {
                   onSettled: {
                     if (!rowItem.current || root.viewIsFrozen || !root.opened) return
                     var i = rowItem.framedIndex()
-                    if (i >= 0) root.selectedApp = i
+                    // noteSelectedApp rather than a bare write: the row has to
+                    // hold this scroll after it stops being the centred one,
+                    // and the compositor has to be told about it on the way
+                    // out. See root.rowSelections and commitFocusArgs.
+                    if (i >= 0) root.noteSelectedApp(i)
                   }
                 }
 
@@ -2783,12 +3514,81 @@ Item {
                       width: thumb.geom.w
                       height: thumb.geom.h
                       radius: Style.space(6)
-                      color: Color.background
-                      border.width: thumb.ringed ? Style.space(2) : 0
-                      border.color: thumb.active
-                        ? Color.accent
-                        : Util.alpha(Color.foreground, 0.4)
-                      clip: true
+
+                      // Nothing at all behind a thumbnail that has a picture,
+                      // so a window's own alpha lands on the wallpaper drawn
+                      // behind the row -- which is exactly what it lands on
+                      // when the window is on the desktop.
+                      //
+                      // A flat fill here made every transparent window opaque.
+                      // In a row of thumbnails that reads as a slightly darker
+                      // terminal and nobody notices; at the top of a zoom it is
+                      // the whole picture, because there the strip is standing
+                      // in for the desktop pixel for pixel and the desktop is
+                      // still visible around it. So a window you were looking
+                      // *through* went solid for the length of the zoom and
+                      // came back the instant the real one took over -- the
+                      // transparency "disappearing" on the way in.
+                      //
+                      // Still the flat fill while the capture is empty: that is
+                      // the placeholder a thumbnail with nothing in it needs,
+                      // and the one zoomOpener waits on rather than uncover.
+                      color: thumb.hasPicture ? "transparent" : Color.background
+
+                      readonly property real ringWidth: Style.space(2)
+
+                      // Whether there is anything in this thumbnail yet, as
+                      // opposed to whether it has been laid out. The zoom asks
+                      // its target this before uncovering; see zoomOpener.
+                      readonly property bool hasPicture: capture.hasContent
+
+                      // When this thumbnail last asked for a frame. The
+                      // scheduler picks the stalest picture on screen, so this
+                      // is what "stalest" is measured on -- and it lives on
+                      // the delegate rather than in a map at the root so that
+                      // it cannot outlive the thumbnail it describes. Rows are
+                      // rebuilt every time a window opens or closes.
+                      //
+                      // Zero, not Date.now(): a delegate that has just been
+                      // built has either no picture at all or one retained
+                      // from a previous summon, and both want a frame sooner
+                      // than a thumbnail that was refreshed a moment ago.
+                      property real lastCaptureMs: 0
+
+                      // The one way a frame is ever asked for. Everything --
+                      // the scheduler's rotation, the zoom target, the grab a
+                      // freshly built delegate needs -- comes through here, so
+                      // that nothing can refresh without the scheduler being
+                      // able to see that it did.
+                      function requestCapture() {
+                        capture.captureFrame()
+                        thumb.lastCaptureMs = Date.now()
+                      }
+
+                      // Whether this window is anywhere near the part of its
+                      // row that is on screen.
+                      //
+                      // The vertical half of this has always been here
+                      // (rowItem.nearViewport); this is the half a scrolling
+                      // layout makes necessary. A workspace strip here is
+                      // routinely two and a half monitors wide and the row
+                      // shows about two of them, so a visible row would
+                      // otherwise be putting windows a screen's width past its
+                      // own edge into the scheduler's on-screen rotation --
+                      // spending the budget on pictures nobody can see, which
+                      // is the same traffic nearViewport refuses on the other
+                      // axis.
+                      //
+                      // Measured against rowViewport rather than the
+                      // wallpaper: what is drawn is the whole clipped row, and
+                      // windows overhanging the wallpaper are half the point
+                      // of the picture.
+                      readonly property bool nearRow: {
+                        var left = thumb.geom.x + rowContent.x
+                        var slack = rowItem.monWidthPx * 0.5
+                        return left + thumb.geom.w > -slack
+                          && left < rowViewport.width + slack
+                      }
 
                       // A thumbnail is a long way down from the window it
                       // shows -- better than 2x on a 1080p panel, more than
@@ -2818,14 +3618,24 @@ Item {
                       // texture per thumbnail rather than the capture itself.
                       Item {
                         id: captureBox
-                        // Without this inset the capture paints edge-to-edge
-                        // over the border above -- hover was firing correctly
-                        // (containsMouse, the click, the border binding all
-                        // worked) but the video was visually covering the ring
-                        // the whole time. Tracking border.width means an
-                        // unringed thumbnail is pure window, edge to edge.
+                        // Deliberately the full thumbnail, and deliberately
+                        // not inset by the ring. The ring used to be the
+                        // Rectangle's own border with this box tracking its
+                        // width, which drew correctly and cost a great deal
+                        // more than it looked: the ring appears and disappears
+                        // on *hover*, so every pointer crossing resized this
+                        // item by two pixels, and this item's size is the
+                        // layer's texture size -- a fresh offscreen buffer
+                        // allocated and re-rendered for each thumbnail the
+                        // mouse passed over, at up to twice its device size.
+                        // Moving the pointer across the overview was
+                        // reallocating textures the whole way.
+                        //
+                        // The ring is a sibling drawn after this instead, so
+                        // it covers the same outer two pixels it used to
+                        // occupy -- the same pixels, the same colour, and
+                        // nothing under it moves when it comes and goes.
                         anchors.fill: parent
-                        anchors.margins: thumb.border.width
 
                         // 1 for a thumbnail already at or above the capture's
                         // own resolution: supersampling past the source buys
@@ -2836,7 +3646,7 @@ Item {
                         // already most of the way to clean.
                         readonly property real superSample: {
                           var src = capture.sourceSize
-                          var devW = captureBox.width * Screen.devicePixelRatio
+                          var devW = captureBox.width * viewport.dpr
                           if (!capture.hasContent || !(src.width > 0) || !(devW > 0)) return 1
                           return Math.max(1, Math.min(2, src.width / devW))
                         }
@@ -2845,31 +3655,43 @@ Item {
                         layer.smooth: true
                         layer.mipmap: true
                         layer.textureSize: Qt.size(
-                          Math.max(1, Math.round(captureBox.width * Screen.devicePixelRatio * captureBox.superSample)),
-                          Math.max(1, Math.round(captureBox.height * Screen.devicePixelRatio * captureBox.superSample)))
+                          Math.max(1, Math.round(captureBox.width * viewport.dpr * captureBox.superSample)),
+                          Math.max(1, Math.round(captureBox.height * viewport.dpr * captureBox.superSample)))
 
                         ScreencopyView {
                           id: capture
                           anchors.fill: parent
                           captureSource: thumb.modelData.wayland
-                          // Live only while this row is at or near the
-                          // viewport. Every thumbnail is its own screencopy
-                          // stream against the compositor, so keeping all of
-                          // them running for rows scrolled far off-screen is
-                          // sustained GPU and Wayland buffer traffic
-                          // competing with the very frames a smooth scroll
-                          // needs. A row that goes off-screen keeps the last
-                          // frame it captured and resumes streaming before it
-                          // comes back into view.
+                          // Never live. Frames come from the capture
+                          // scheduler at the top of this file, which hands a
+                          // fixed budget of captures per second to whichever
+                          // thumbnail most needs one.
                           //
-                          // Deliberately still tied to nothing but the row's
-                          // position, right through the leave. Stopping the
-                          // streams the moment a dive starts looks like an
-                          // obvious saving -- they are about to be scaled off the
-                          // edge of the screen -- but it is a change of state at
-                          // the exact frame that has to be unremarkable, on the
-                          // one surface the eye is following.
-                          live: rowItem.nearViewport
+                          // The gating this replaces was on position alone,
+                          // and position was never the expensive part. A live
+                          // view re-arms itself from its own repaint, so a
+                          // thumbnail that is merely *visible* renders at the
+                          // display's refresh rate forever -- rebuilding the
+                          // mipmapped layer around it every time -- with the
+                          // overview open and nobody touching anything. The
+                          // old comment here argued that freezing during
+                          // motion was the reverse of a saving, and it was
+                          // right: setLive(true) fires captureFrame() on every
+                          // visible thumbnail at once on the single frame the
+                          // motion stops. That is an argument against the
+                          // on/off switch, not against stopping the loop --
+                          // and it is why the budget is metered by a token
+                          // bucket that holds at most one, so the settle frame
+                          // can spend a single capture and no more.
+                          //
+                          // captureFrame() leaves the picture that is already
+                          // there alone until the new one lands, so a refresh
+                          // is never a flicker and never a grey frame; the
+                          // only thing that clears a thumbnail is the
+                          // captureSource round trip in captureRevive below,
+                          // which is for a context the compositor has already
+                          // torn down.
+                          live: false
                           paintCursor: false
 
                           // No constraintSize. It reads like a cap on how big a
@@ -2893,9 +3715,104 @@ Item {
                           // capture into: asking then is work that can only
                           // fail, and it logged a warning per thumbnail for the
                           // privilege.
+                          //
+                          // Not gated on being drawn. captureFrame() is not
+                          // the paint-driven path that live re-arming is: a
+                          // view whose whole subtree is `visible: false`
+                          // refreshes perfectly well when asked, which is what
+                          // lets the scheduler keep the render margin warm.
+                          // Only the overview being *down* is a real
+                          // obstacle, and that is what the guard is for.
                           Component.onCompleted:
-                            if (root.opened && !capture.live) capture.captureFrame()
+                            if (root.opened) thumb.requestCapture()
+
+                          // The same grab, for a thumbnail that was built while
+                          // the overview was down -- which leaves it with no
+                          // picture in it at all, held grey until something
+                          // asks. Nothing asks on its own any more: with the
+                          // scheduler in charge there is no live stream to
+                          // wander in and fill it.
+                          //
+                          // Rows are meant to survive between summons and now
+                          // do (see freezeToplevels), so this is the rare case
+                          // rather than the usual one: a window opened or
+                          // closed while the overview was down, which rebuilds
+                          // the rows it was in. viewReset() is emitted by
+                          // open() itself, which is early enough to be in hand
+                          // for the frame the zoom is measured from.
+                          Connections {
+                            target: root
+                            function onViewReset() {
+                              if (root.opened && !capture.hasContent) thumb.requestCapture()
+                            }
+                          }
+
+                          // A stream that comes back is a stream that gets to
+                          // fail again.
+                          onHasContentChanged: if (capture.hasContent) captureRevive.tries = 0
                         }
+                      }
+
+                      // Puts a dead screencopy back on its feet.
+                      //
+                      // Quickshell tears the recording context down when the
+                      // compositor ends a stream -- and hyprland_toplevel_export
+                      // ends them for ordinary reasons, a toplevel being
+                      // remapped or moved between monitors among them. Tearing
+                      // it down clears hasContent, which drops the thumbnail
+                      // back to the bare Color.background rectangle underneath:
+                      // the thumbnail that "goes grey".
+                      //
+                      // Nothing brings it back. There is no retry inside the
+                      // view, and its `stopped` signal is declared but never
+                      // emitted, so hasContent falling is the only notice we
+                      // get. createContext() is reachable from exactly one
+                      // place in the public API -- assigning captureSource --
+                      // so that is what this does, and the assignment has to
+                      // actually change the value to count, hence the round
+                      // trip through null.
+                      //
+                      // Capped, and only for a thumbnail on screen with the
+                      // overview up: a window that genuinely cannot be captured
+                      // must cost four attempts and then be left alone, not
+                      // become a permanent timer.
+                      Timer {
+                        id: captureRevive
+                        property int tries: 0
+                        interval: 450
+                        repeat: true
+                        running: root.opened && !capture.hasContent
+                          && rowItem.nearViewport && thumb.nearRow
+                          && captureRevive.tries < 4
+                        onTriggered: {
+                          var src = thumb.modelData ? thumb.modelData.wayland : null
+                          if (!src) return
+                          captureRevive.tries++
+                          capture.captureSource = null
+                          capture.captureSource = src
+                          // Creating a context asks for a frame by itself, so
+                          // this counts as one against the budget: without it
+                          // the scheduler sees a thumbnail whose picture is as
+                          // old as the failure and spends a capture chasing
+                          // the one already on its way.
+                          thumb.lastCaptureMs = Date.now()
+                        }
+                      }
+
+                      // The ring, drawn over the capture rather than beside
+                      // it. Same two pixels the Rectangle's own border used to
+                      // paint and the capture used to be inset out of -- see
+                      // captureBox, which is a fixed size now precisely so
+                      // that this can come and go on hover without anything
+                      // underneath being resized.
+                      Rectangle {
+                        anchors.fill: parent
+                        color: "transparent"
+                        radius: thumb.radius
+                        border.width: thumb.ringed ? thumb.ringWidth : 0
+                        border.color: thumb.active
+                          ? Color.accent
+                          : Util.alpha(Color.foreground, 0.4)
                       }
 
                       // No title bar over the bottom of the thumbnail. At this
@@ -3043,5 +3960,18 @@ Item {
   OmariAltTab {
     id: altTab
     overview: root
+  }
+
+  // Omarchy intentionally has no install/uninstall hooks. It does, however,
+  // disable a plugin before removing its checkout. That destroys this
+  // keepLoaded overlay while the files still exist. Clean the generated
+  // Hyprland toggles only in that case: normal shell shutdown and hot reload
+  // both destroy this object too, but the registry still reports it enabled.
+  Component.onDestruction: {
+    if (!root.pluginRegistry || !root.manifest || !root.manifest.id
+        || root.pluginRegistry.isEnabled(root.manifest.id)) return
+    Quickshell.execDetached([
+      "bash", root.pluginDir + "/bin/omari-toggle", "all", "off"
+    ])
   }
 }
