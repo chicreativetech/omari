@@ -1,4 +1,4 @@
-# Omari
+# Omari - The Omarchy Niri plugin
 
 **Omari brings a Niri-style scrolling workflow to Omarchy.**
 
