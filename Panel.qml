@@ -14,8 +14,10 @@ import qs.Ui
 // its screen is OmariOverview.qml, this plugin's "overlay" entry point.
 //
 // The overview and Alt-Tab switches are shown only while Omari mode is on, and
-// their features go down with it -- see bin/omari-toggle, which owns that
-// cascade so the CLI and the IPC methods get it too.
+// they follow it: the mode going on turns both on, the mode going off takes
+// both down -- see bin/omari-toggle, which owns that cascade so the CLI and
+// the IPC methods get it too. Either can still be switched off on its own
+// while the mode is up; the next flip of the mode sets them again.
 // They are three independent toggles, but they are not three independent
 // features: the overview draws the scrolling layout's workspaces and Alt-Tab
 // is the keyboard half of moving along the same tape, so offering either one
@@ -59,11 +61,10 @@ Panel {
   ToggleFlag {
     id: modeFlag
     flagName: "mode"
-    // bin/omari-toggle takes the overview and Alt-Tab down with the mode, and
-    // puts back the ones that were up when it goes back on. Neither of those
-    // flags ran the script, so neither knows: re-probe both once the mode's
-    // own run has landed. Cheap, and only on an actual toggle -- not the
-    // 20-second poll this deliberately does not do.
+    // bin/omari-toggle turns the overview and Alt-Tab on with the mode and off
+    // with it. Neither of those flags ran the script, so neither knows:
+    // re-probe both once the mode's own run has landed. Cheap, and only on an
+    // actual toggle -- not the 20-second poll this deliberately does not do.
     onSettled: {
       overviewFlag.refresh()
       alttabFlag.refresh()

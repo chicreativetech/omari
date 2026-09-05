@@ -17,10 +17,10 @@
 #
 # `mode` carries the other two with it. The overview draws the scrolling
 # layout's workspaces and Alt-Tab walks the same tape, so neither is meant to
-# be left running on a stock Hyprland layout: turning the mode off takes them
-# down, and turning it back on puts back exactly the ones that were up. What
-# was up is remembered in $XDG_STATE_HOME/omari/suspended -- deliberately not
-# in the toggles directory, which is sourced as lua.
+# be left running on a stock Hyprland layout -- and neither is worth hunting
+# for on a fresh install either. Turning the mode on turns both on, turning it
+# off takes both down. Either one can still be switched off on its own
+# afterwards; the next flip of the mode is what sets them again.
 
 set -euo pipefail
 
@@ -43,17 +43,24 @@ PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 TOGGLES_DIR="$STATE_HOME/omarchy/toggles/hypr"
-SUSPENDED_FILE="$STATE_HOME/omari/suspended"
+# Written by the version that remembered which companions were up across a
+# `mode off`. The cascade is unconditional now and nothing reads this, so an
+# upgraded install is carrying a state file whose meaning is gone: clear it on
+# any run that changes state, and take the directory with it once it is empty.
+STALE_SUSPENDED_FILE="$STATE_HOME/omari/suspended"
 
 # The configs `mode` pulls along behind it, in the order the popup lists them.
 COMPANIONS=(overview alttab)
 
-flag_file() {
-  echo "$TOGGLES_DIR/omari-$1.lua"
+clear_stale_state() {
+  rm -f "$STALE_SUSPENDED_FILE"
+  # Only succeeds while the directory holds nothing else, which is the only
+  # case where removing it is this script's business.
+  rmdir "$(dirname "$STALE_SUSPENDED_FILE")" 2>/dev/null || true
 }
 
-is_on() {
-  [[ -f $(flag_file "$1") ]]
+flag_file() {
+  echo "$TOGGLES_DIR/omari-$1.lua"
 }
 
 # Copy the source in rather than symlink it: the toggles directory is Omarchy's
@@ -89,37 +96,16 @@ off() {
 
 # ------------------------------------------------------------ mode's cascade
 #
-# Written before anything is turned off, read after the mode is back on, and
-# gone either way once it has been used. An empty file is a real answer -- "the
-# mode went down with both companions already off" -- so its *existence* is
-# never used as the question; the names in it are.
-suspend_companions() {
-  local name suspended=()
+# Unconditional in both directions, and deliberately not a memory of what was
+# up last time: `mode on` is the one switch a new install is told to find, so
+# it hands over the whole feature rather than the third of it that happened to
+# survive the last `mode off`. Both actions are idempotent, so there is nothing
+# to test before running them.
+cascade_companions() {
+  local action="$1" name
   for name in "${COMPANIONS[@]}"; do
-    if is_on "$name"; then
-      suspended+=("$name")
-      off "$name"
-    fi
+    "$action" "$name"
   done
-  mkdir -p "$(dirname "$SUSPENDED_FILE")"
-  : >"$SUSPENDED_FILE"
-  if ((${#suspended[@]})); then
-    printf '%s\n' "${suspended[@]}" >"$SUSPENDED_FILE"
-  fi
-}
-
-resume_companions() {
-  [[ -f $SUSPENDED_FILE ]] || return 0
-  local name
-  while IFS= read -r name; do
-    # Only ever the two names this script writes. A hand-edited file, or one
-    # left by a future version that knows a third config, must not be able to
-    # talk this one into copying an arbitrary path into the toggles directory.
-    case $name in
-      overview | alttab) on "$name" ;;
-    esac
-  done <"$SUSPENDED_FILE"
-  rm -f "$SUSPENDED_FILE"
 }
 
 case $NAME in
@@ -133,9 +119,7 @@ case $NAME in
     rm -f "$TOGGLES_DIR/omari-mode.lua" \
       "$TOGGLES_DIR/omari-overview.lua" \
       "$TOGGLES_DIR/omari-alttab.lua"
-    # Everything is off by request, so there is nothing suspended to come back:
-    # leaving the memo would resurrect the overview on the next `mode on`.
-    rm -f "$SUSPENDED_FILE"
+    clear_stale_state
     hyprctl reload >/dev/null 2>&1 || true
     echo "off"
     exit 0
@@ -162,6 +146,8 @@ if [[ $ACTION == toggle ]]; then
   if [[ -f $FLAG_FILE ]]; then ACTION=off; else ACTION=on; fi
 fi
 
+clear_stale_state
+
 case $ACTION in
   on)
     on "$NAME"
@@ -170,7 +156,7 @@ case $ACTION in
     # that as the script having failed -- which it did, silently, for every
     # `omari-toggle overview on` this was written with.
     if [[ $NAME == mode ]]; then
-      resume_companions
+      cascade_companions on
     fi
     ;;
   off)
@@ -178,7 +164,7 @@ case $ACTION in
     # on, so a reload racing this never sees an overview bound over a layout
     # that is no longer scrolling.
     if [[ $NAME == mode ]]; then
-      suspend_companions
+      cascade_companions off
     fi
     off "$NAME"
     ;;
