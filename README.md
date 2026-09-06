@@ -5,6 +5,20 @@ overview, and a live Alt-Tab switcher to Omarchy's Hyprland desktop.
 It uses the current Omarchy palette, font, spacing, wallpaper, and corner
 rounding. Niri supplies the navigation inspiration; Omari runs on Hyprland.
 
+## Screenshots
+
+### Scrolling desktop
+
+![Omari desktop with horizontally arranged window columns](assets/omari.png)
+
+### Workspace overview
+
+![Omari overview with vertically arranged workspaces and window previews](assets/omari-overview.png)
+
+### Alt-Tab switcher
+
+![Omari Alt-Tab switcher with window previews and scope filters](assets/omari-alttab.png)
+
 ## Requirements
 
 - Omarchy with the Quattro shell and `omarchy plugin` commands.
@@ -42,15 +56,59 @@ Existing configuration files are not edited.
 
 ## Controls
 
-| Action | Control |
+### Keyboard shortcuts
+
+`SUPER` is the Windows/Command key. Enable the corresponding Omari feature
+in the bar popup to use its shortcuts.
+
+**Desktop navigation**
+
+| Shortcut | Action |
 | --- | --- |
-| Move along window columns | Three-finger horizontal swipe or SUPER+arrows |
-| Change workspace | Three-finger vertical swipe or SUPER+PageDown/PageUp |
-| Toggle overview | Four-finger swipe up or SUPER+ALT+O |
-| Browse overview | Two-finger scrolling, arrow keys, or click a window |
-| Close overview | Escape |
-| Switch windows | Hold ALT, press Tab (SHIFT reverses), release ALT |
-| Filter switcher | A: all windows, W: workspace, O: display |
+| SUPER+Left / Right | Focus the previous / next window column |
+| SUPER+Up / Down | Focus the window above / below within a column |
+| SUPER+PageDown | Go to the next workspace |
+| SUPER+PageUp | Go to the previous workspace |
+| SUPER+ALT+O | Open the overview |
+| ALT+Tab | Open the window switcher and select the next window |
+| ALT+SHIFT+Tab | Open the window switcher and select the previous window |
+
+**While the overview is open**
+
+| Shortcut | Action |
+| --- | --- |
+| Up / Down | Select the previous / next workspace row |
+| Left / Right | Select the previous / next window in the row |
+| Enter or Space | Activate the selected window or empty workspace |
+| SUPER+ALT+O | Activate the selection and close the overview |
+| Escape | Cancel and return to the original desktop |
+
+**While the Alt-Tab switcher is open**
+
+Keep `ALT` held while browsing or changing the scope.
+
+| Shortcut | Action |
+| --- | --- |
+| Tab / SHIFT+Tab | Select the next / previous window |
+| Left / Right | Select the previous / next window |
+| A | Show windows from all workspaces |
+| W | Show windows from the current workspace |
+| O | Show windows from the current display |
+| Release ALT | Activate the selected window |
+| Enter or Space | Activate the selected window immediately |
+| Escape | Cancel without switching windows |
+
+### Gestures and mouse
+
+| Control | Action |
+| --- | --- |
+| Three-finger horizontal swipe | Scroll along window columns |
+| Three-finger vertical swipe | Change workspace |
+| Four-finger swipe up | Open the overview |
+| Four-finger swipe down in the overview | Activate the selection and close the overview |
+| Two-finger scrolling in the overview | Browse workspaces vertically or windows horizontally |
+| Click a window preview | Activate that window |
+| Click the empty workspace in the overview | Switch to that workspace |
 
 ## Disable and remove
 
