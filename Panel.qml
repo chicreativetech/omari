@@ -37,16 +37,16 @@ Panel {
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
-  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property color dim: Util.alpha(foreground, 0.65)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color iconColor: modeFlag.enabled ? foreground : dim
   readonly property color barIconColor: modeFlag.enabled ? barForeground : Qt.darker(barForeground, 1.55)
-  readonly property string modeToggleHint: modeFlag.enabled ? "Turn Omari mode off" : "Turn Omari mode on"
+  readonly property string modeToggleHint: modeFlag.enabled ? "Turn Omari off" : "Turn Omari on"
   readonly property string overviewToggleHint: overviewFlag.enabled ? "Turn the overview swipe off" : "Turn the overview swipe on"
   readonly property string alttabToggleHint: alttabFlag.enabled ? "Turn the Alt-Tab switcher off" : "Turn the Alt-Tab switcher on"
-  readonly property string statusText: modeFlag.error !== "" ? "Omari mode is unavailable"
+  readonly property string statusText: modeFlag.error !== "" ? "Omari is unavailable"
     : !modeFlag.loaded ? "Checking status…"
-    : (modeFlag.enabled ? "Omari mode is on" : "Omari mode is off")
+    : (modeFlag.enabled ? "Omari is on" : "Omari is off")
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -123,7 +123,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(380) + 200)
     // No height cap. The cap used to be space(420), which fit the popup back
     // when it explained one switch; the overview's paragraph and switch pushed
     // the column past it and the bottom of the content was simply clipped.
@@ -173,7 +173,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Omari enables niri-like scrollable tiling in Omarchy: windows scroll along a horizontal tape instead of stacking behind each other. A column can go full width without hiding your other apps behind it — scroll back to them with a three-finger swipe or SUPER+arrows, just like niri. SUPER+PageDown/PageUp move between workspaces."
+          text: "Omari brings a Niri-style scrolling workflow to Omarchy.\n\nIf you love the way the Niri Wayland compositor handles windows and workspaces, but still want to stay with the cool Omarchy gang, this plugin is for you.\n\nOmari builds on Omarchy’s existing scrolling layout and enhances it to feel smoother, more natural, and much closer to the Niri experience."
           wrapMode: Text.WordWrap
           color: root.dim
           font.family: root.fontFamily
@@ -183,7 +183,7 @@ Panel {
         Toggle {
           id: modeToggle
           width: parent.width
-          label: "Enable Omari mode"
+          label: "Enable Omari"
           checked: modeFlag.enabled
           foreground: root.foreground
           fontFamily: root.fontFamily
@@ -227,7 +227,16 @@ Panel {
 
           Text {
             width: parent.width
-            text: "The overview shows every workspace as a row of live window thumbnails, niri-style — scroll down for more workspaces, click a thumbnail to jump to it. Swipe up with 4 fingers to open it, again (or Escape) to close it."
+            text: "Overview"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+          }
+
+          Text {
+            width: parent.width
+            text: "Niri’s Overview mode is available in Omari with SUPER + ALT + O or a 4-finger swipe up on the trackpad. It gives you a zoomed-out view of all open applications across your workspaces."
             wrapMode: Text.WordWrap
             color: root.dim
             font.family: root.fontFamily
@@ -237,7 +246,7 @@ Panel {
           Toggle {
             id: overviewToggle
             width: parent.width
-            label: "Enable overview"
+            label: "Enable Overview mode"
             checked: overviewFlag.enabled
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -276,7 +285,16 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Alt-Tab becomes niri's window switcher: hold ALT and press Tab to walk a row of live window thumbnails, release to land on one. While it is up, A, W and O narrow the row to all windows, this workspace's, or this monitor's. Replaces Omarchy's ALT+Tab; SUPER+Tab still changes workspace."
+            text: "ALT+TAB"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+          }
+
+          Text {
+            width: parent.width
+            text: "Omari also includes a Niri-inspired ALT+TAB interface for quickly switching between applications. You can show all applications or limit the view to the current workspace or output."
             wrapMode: Text.WordWrap
             color: root.dim
             font.family: root.fontFamily
@@ -286,7 +304,7 @@ Panel {
           Toggle {
             id: alttabToggle
             width: parent.width
-            label: "Enable Alt-Tab switcher"
+            label: "Enable Niri-style ALT+TAB"
             checked: alttabFlag.enabled
             foreground: root.foreground
             fontFamily: root.fontFamily

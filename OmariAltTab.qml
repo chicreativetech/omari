@@ -656,7 +656,7 @@ Item {
         y: Math.round(parent.height * 0.055)
         width: scopeRow.implicitWidth + Style.space(28)
         height: scopeRow.implicitHeight + Style.space(14)
-        radius: Style.space(8)
+        radius: Style.cornerRadius
         color: Util.alpha(Color.background, 0.92)
         border.width: Math.max(1, Style.space(1))
         border.color: Util.alpha(Color.foreground, 0.28)
@@ -854,7 +854,7 @@ Item {
                 y: panel.bandHeight - plate.height
                 width: card.tileWidth + 2 * panel.cardPadding
                 height: card.tileHeight + 2 * panel.cardPadding
-                radius: Style.space(12)
+                radius: Style.cornerRadius
                 // The plate is the selection. Unselected windows are the bare
                 // thumbnail with nothing around it, so the row reads as
                 // windows rather than as a strip of framed tiles -- the same
@@ -871,7 +871,7 @@ Item {
                   anchors.centerIn: parent
                   width: card.tileWidth
                   height: card.tileHeight
-                  radius: Style.space(6)
+                  radius: Style.cornerRadius
                   color: Color.background
                   clip: true
                   opacity: card.current ? 1.0 : 0.72

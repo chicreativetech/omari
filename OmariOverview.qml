@@ -2745,7 +2745,11 @@ Item {
     // the overview for a frame in the middle of a dive.
     visible: true
     anchors { top: true; bottom: true; left: true; right: true }
-    color: "transparent"
+    // Clear the entire surface, including edge pixels produced by fractional
+    // scaling. A child Rectangle over a transparent window can leave a thin
+    // wallpaper seam when logical bounds round to the physical buffer size.
+    color: Util.alpha(Qt.lighter(Color.background, 1.75),
+      root.surfaceLive ? root.backdropOpacity * root.exitOpacity : 0)
     WlrLayershell.namespace: "omari-overview"
     // Overlay only while it is actually showing something.
     //
@@ -2815,32 +2819,6 @@ Item {
     // the overview is down, so this costs nothing while closed.
     updatesEnabled: true
 
-    Rectangle {
-      anchors.fill: parent
-      // The three children below are what the surface actually shows, and none
-      // of them exists as far as the renderer is concerned while the overview
-      // is down -- which is what makes an always-mapped surface affordable.
-      // `visible` and not `opacity`, deliberately: an item at zero opacity is
-      // still laid out, still batched and still drawn.
-      visible: root.surfaceLive
-      // Flat, opaque, and *lighter* than the theme's Color.background, not
-      // darker. The overview is nothing but dark app thumbnails, and the
-      // wallpaper thumbnail behind each row carries its own drop shadow —
-      // against a near-black backdrop both the shadows and the windows' own
-      // edges disappear, and the rows read as one continuous smear. A mid
-      // grey is what separates them. Opaque for the same reason: letting the
-      // real desktop show through put live wallpaper detail directly behind
-      // thumbnails of that same wallpaper.
-      color: Qt.lighter(Color.background, 1.75)
-      // Clears as the view dives into a window, so what the strip is growing
-      // against is the real desktop it is about to become, and comes up almost
-      // at once as the view pulls back out of one, so nothing is ever seen
-      // twice over. The two directions do not share a curve; see
-      // root.backdropOpacity for why they cannot. Fades again, on top of
-      // either, through exitOpacity on the way out of a dismissal.
-      opacity: root.backdropOpacity * root.exitOpacity
-    }
-
     // Clicking past the rows is a cancel, not a choice: nothing was aimed at.
     MouseArea {
       anchors.fill: parent
@@ -2857,9 +2835,9 @@ Item {
       // is the same statement it always was, said about the overview instead
       // of about the window.
       focus: root.opened
-      // The strip's half of the exit fade; the backdrop above carries the
-      // other half. Both are children of the window rather than of one item,
-      // so the fade is applied to each rather than to the pair.
+      // The strip's half of the exit fade; the window background carries the
+      // other half through the window clear color. Apply the fade once to
+      // each, so the backdrop and thumbnails retain their existing curves.
       opacity: root.exitOpacity
 
       Keys.onPressed: function(event) {
@@ -3513,7 +3491,7 @@ Item {
                       // known before the first pixel is captured.
                       width: thumb.geom.w
                       height: thumb.geom.h
-                      radius: Style.space(6)
+                      radius: Style.cornerRadius
 
                       // Nothing at all behind a thumbnail that has a picture,
                       // so a window's own alpha lands on the wallpaper drawn
@@ -3971,7 +3949,14 @@ Item {
     if (!root.pluginRegistry || !root.manifest || !root.manifest.id
         || root.pluginRegistry.isEnabled(root.manifest.id)) return
     Quickshell.execDetached([
-      "bash", root.pluginDir + "/bin/omari-toggle", "all", "off"
+      // Do not launch a file from the checkout: removal can delete it before
+      // bash opens it. Keep cleanup independent of plugin files.
+      "bash", "-c",
+      'state="${XDG_STATE_HOME:-$HOME/.local/state}"; '
+      + 'rm -f -- "$state/omarchy/toggles/hypr/omari-mode.lua" '
+      + '"$state/omarchy/toggles/hypr/omari-overview.lua" '
+      + '"$state/omarchy/toggles/hypr/omari-alttab.lua"; '
+      + 'hyprctl reload >/dev/null 2>&1'
     ])
   }
 }
