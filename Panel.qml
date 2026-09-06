@@ -173,11 +173,25 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Omari brings a Niri-style scrolling workflow to Omarchy.\n\nIf you love the way the Niri Wayland compositor handles windows and workspaces, but still want to stay with the cool Omarchy gang, this plugin is for you.\n\nOmari builds on Omarchy’s existing scrolling layout and enhances it to feel smoother, more natural, and much closer to the Niri experience."
+          text: "Omari brings a Niri-style scrolling workflow to Omarchy.\n\nOmari builds on Omarchy’s existing scrolling layout and enhances it to feel smoother, more natural, and much closer to the Niri experience."
           wrapMode: Text.WordWrap
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+        }
+
+        Text {
+          width: parent.width
+          text: '<a href="https://github.com/chicreativetech/omari#keyboard-shortcuts">Omari controls</a>'
+          textFormat: Text.RichText
+          linkColor: Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+          onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+
+          HoverHandler {
+            cursorShape: Qt.PointingHandCursor
+          }
         }
 
         Toggle {
