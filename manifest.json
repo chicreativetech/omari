@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bergdahlchi.omari",
   "name": "Omari",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "author": "bergdahlchi",
   "license": "MIT",
   "description": "You like the Niri wayland compositor but don't want to leave the cool world of Omarchy. Omari adds Niri-inspired scrolling, gestures, Workspace overview and Alt-Tab switcher of course styled with your Omarchy theme.",
@@ -17,7 +17,7 @@
   },
   "barWidget": {
     "displayName": "Omari",
-    "description": "Toggle scrolling tiling, the workspace overview, and Alt-Tab.",
+    "description": "Toggle Niri-style scrolling layout, workspace overview and Alt-Tab switcher.",
     "category": "Window management",
     "allowMultiple": false,
     "defaultSection": "left"
