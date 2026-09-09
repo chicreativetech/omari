@@ -1,9 +1,6 @@
 # Omari — Niri-inspired navigation for Omarchy
 
-Omari brings horizontal scrolling columns, a vertically arranged workspace
-overview, and a live Alt-Tab switcher to Omarchy's Hyprland desktop.
-It uses the current Omarchy palette, font, spacing, wallpaper, and corner
-rounding. Niri supplies the navigation inspiration; Omari runs on Hyprland.
+If you like the Niri wayland compositor but don't want to leave the cool world of Omarchy. Omari adds Niri-inspired scrolling, gestures, Workspace overview and Alt-Tab switcher of course styled with your Omarchy theme.
 
 ## Screenshots
 
