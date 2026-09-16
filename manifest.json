@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bergdahlchi.omari",
   "name": "Omari",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "author": "bergdahlchi",
   "license": "MIT",
   "description": "You like the Niri wayland compositor but don't want to leave the cool world of Omarchy. Omari adds Niri-inspired scrolling, gestures, Workspace overview and Alt-Tab switcher of course styled with your Omarchy theme.",

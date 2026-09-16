@@ -53,6 +53,12 @@ Existing configuration files are not edited.
 
 ## Controls
 
+The bar popup has two tabs. **Info** says what Omari is and carries all three
+switches — **Enable Omari**, the overview, and Alt-Tab — each under the
+sentence describing what it turns on. **Keys** carries the shortcuts, one field
+per feature that is switched on, plus the overview's **Reverse scroll direction
+in overview** switch.
+
 ### Keyboard shortcuts
 
 `SUPER` is the Windows/Command key. Enable the corresponding Omari feature
@@ -66,8 +72,8 @@ in the bar popup to use its shortcuts.
 | SUPER+Up / Down | Focus the window above / below within a column |
 | SUPER+PageDown | Go to the next workspace |
 | SUPER+PageUp | Go to the previous workspace |
-| SUPER+ALT+O | Open the overview |
-| ALT+Tab | Open the window switcher and select the next window |
+| SUPER+ALT+O | Open the overview (configurable) |
+| ALT+Tab | Open the window switcher and select the next window (configurable) |
 | ALT+SHIFT+Tab | Open the window switcher and select the previous window |
 
 **While the overview is open**
@@ -95,6 +101,50 @@ Keep `ALT` held while browsing or changing the scope.
 | Enter or Space | Activate the selected window immediately |
 | Escape | Cancel without switching windows |
 
+### Changing the shortcuts
+
+The overview's and Alt-Tab's shortcuts are editable in the popup's **Keys**
+tab, under each feature's heading (the feature has to be switched on in
+**Info** for its field to show). Type modifiers and a key separated by `+`
+(`SUPER + ALT + O`, `CTRL + ALT + TAB`) and press Enter or click the check
+button beside the field; the restore button next to it puts the default back.
+A shortcut needs at least one modifier, because both features are
+held-modifier shortcuts — the Alt-Tab switcher stays up for exactly as long as
+its modifier does, and the row is walked backwards by adding `SHIFT`.
+
+Shortcuts are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/omari/keybinds.conf`
+and read by `hypr/omari-overview.lua` and `hypr/omari-alttab.lua` on every
+Hyprland reload, so they survive a feature being switched off and back on. The
+same edits from a terminal:
+
+```sh
+cd "$HOME/.config/omarchy/plugins/bergdahlchi.omari"
+bash bin/omari-keybind overview set 'SUPER + ALT + O'
+bash bin/omari-keybind alttab reset
+bash bin/omari-keybind alttab get
+```
+
+Rebinding Alt-Tab elsewhere hands `ALT+Tab` back to Omarchy's own bindings.
+`ALT` is the default for a reason worth knowing before moving it: on `SUPER`,
+the switcher's `A` / `W` / `O` scope filters collide with Omarchy's own
+`SUPER+A/W/O` bindings and never reach the switcher.
+
+### Reversing the overview's scroll direction
+
+**Keys** > **Overview** > **Reverse scroll direction in overview** flips what a
+two-finger swipe means inside the overview, on both axes at once. Off, the swipe
+moves the content under your fingers: push up and the stack of workspaces comes
+up with you, push left and the strip of windows goes left. On, both axes answer
+the opposite way — which is the right setting if the rest of your desktop is on
+natural scrolling and this one reads backwards. The mouse wheel is deliberately
+left alone either way: a notch is a request to go somewhere rather than a grip
+on the content, and it keeps the sense every other wheel on the machine has.
+
+The setting lives in `${XDG_CONFIG_HOME:-$HOME/.config}/omari/settings.conf` as
+`overview-reverse-scroll = on|off` and the overview watches that file, so a hand
+edit takes effect as it is saved — no reload, and no Hyprland involved, since
+this one never leaves the shell.
+
 ### Gestures and mouse
 
 | Control | Action |
@@ -103,7 +153,7 @@ Keep `ALT` held while browsing or changing the scope.
 | Three-finger vertical swipe | Change workspace |
 | Four-finger swipe up | Open the overview |
 | Four-finger swipe down in the overview | Activate the selection and close the overview |
-| Two-finger scrolling in the overview | Browse workspaces vertically or windows horizontally |
+| Two-finger scrolling in the overview | Browse workspaces vertically or windows horizontally (direction is switchable, see above) |
 | Click a window preview | Activate that window |
 | Click the empty workspace in the overview | Switch to that workspace |
 
@@ -131,7 +181,7 @@ loads `OmariAltTab.qml` internally. Do not launch a second Quickshell process.
 ```sh
 omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" ./*.qml
-bash -n bin/omari-toggle
+bash -n bin/omari-toggle bin/omari-keybind
 for source in hypr/*.lua; do luac -p "$source"; done
 ```
 

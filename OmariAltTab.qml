@@ -8,14 +8,15 @@ import qs.Commons
 // Omari Alt-Tab: niri's window switcher.
 //
 // One long row of live window thumbnails, most-recently-used first, held up
-// for exactly as long as the ALT that opened it is held down. Tab walks along
-// the row, releasing ALT focuses whatever it stopped on, and A/W/O narrow the
-// row to all windows, this workspace's, or this monitor's.
+// for exactly as long as the modifier that opened it is held down. Tab walks
+// along the row, releasing the modifier focuses whatever it stopped on, and
+// A/W/O narrow the row to all windows, this workspace's, or this monitor's.
 //
-// ALT and only ALT. The switcher used to open on SUPER+TAB as well, and the
-// scope filter could not work there: SUPER+A/W/O are Omarchy's own binds, so
-// the compositor ate the three keys that make this niri's switcher rather than
-// a nicer ALT+TAB. See hypr/omari-alttab.lua.
+// ALT by default, and the scope filter is why: on SUPER, A/W/O are Omarchy's
+// own binds, so the compositor eats the three keys that make this niri's
+// switcher rather than a nicer ALT+TAB. The binding is the user's (the bar
+// popup's Keys tab) and this end follows whatever it is told the modifier is.
+// See hypr/omari-alttab.lua.
 //
 // Instantiated by OmariOverview.qml rather than being an entry point of its
 // own: Omarchy's plugin host mounts exactly one Loader per plugin id (see
@@ -38,11 +39,31 @@ Item {
 
   // ---- session state ----
   //
-  // A "session" is one press-and-hold of ALT. It starts on the first
-  // `omari:alttab step` event, and ends when ALT is released, which commits,
-  // or on Escape/a click, which does not.
+  // A "session" is one press-and-hold of the switcher's modifier. It starts on
+  // the first `omari:alttab step` event, and ends when the modifier is
+  // released, which commits, or on Escape/a click, which does not.
   property bool active: false
   property bool leaving: false
+
+  // Which modifier that is. ALT unless the user has rebound the switcher, in
+  // which case hypr/omari-alttab.lua names it on the event that opens the
+  // session -- it is the end that read the binding. Named rather than derived
+  // here because this end never sees the binding at all.
+  //
+  // Qt reports the two sides of a modifier as different keys, and SUPER as
+  // either Key_Super_L/R or Key_Meta depending on the layout, so a modifier is
+  // a set of key codes rather than one.
+  readonly property var holdKeyCodes: ({
+    "ALT": [Qt.Key_Alt, Qt.Key_AltGr],
+    "SUPER": [Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta],
+    "META": [Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta],
+    "WIN": [Qt.Key_Super_L, Qt.Key_Super_R, Qt.Key_Meta],
+    "CTRL": [Qt.Key_Control],
+    "CONTROL": [Qt.Key_Control],
+    "SHIFT": [Qt.Key_Shift]
+  })
+  property string holdMod: "ALT"
+  readonly property var holdKeys: root.holdKeyCodes[root.holdMod] || root.holdKeyCodes["ALT"]
 
   // Whether the surface is showing anything at all. The layer surface itself
   // stays mapped for the life of the shell -- see panel.visible -- so "is the
@@ -453,6 +474,11 @@ Item {
       var parts = data.split(" ")
       switch (parts[1]) {
       case "step":
+        // parts[3] is the modifier holding the switcher up, appended by
+        // hypr/omari-alttab.lua once the binding became configurable. Absent
+        // from an older config still sitting in the toggles directory, which
+        // can only have been ALT.
+        root.holdMod = parts[3] ? String(parts[3]).toUpperCase() : "ALT"
         root.step(parts[2])
         break
       case "commit":
@@ -640,7 +666,7 @@ Item {
       // `active` already false.
       Keys.onReleased: function(event) {
         if (!root.active || event.isAutoRepeat) return
-        if (event.key !== Qt.Key_Alt) return
+        if (root.holdKeys.indexOf(event.key) < 0) return
         root.commit(null)
         event.accepted = true
       }

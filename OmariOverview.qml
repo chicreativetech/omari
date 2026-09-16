@@ -2197,6 +2197,27 @@ Item {
 
   // ---- scroll input routing ----
 
+  // "Reverse scroll direction in overview" in the popup's Keys tab. Off,
+  // a two-finger swipe moves the content under the fingers: push up and the
+  // stack of workspaces comes up with you, push left and the strip of windows
+  // goes left. On, both axes answer the opposite way, for the same reason a
+  // touchpad has a natural-scrolling switch at all -- which way a swipe reads
+  // is a habit, not a fact, and the habit is usually set by the rest of the
+  // desktop rather than by this overview.
+  //
+  // Only the touchpad paths read it. The mouse wheel below is left alone in
+  // both places: a notch is a request to go somewhere rather than a grip on
+  // the content, it already reads the way every other wheel on the machine
+  // does, and a preference about swiping is not a reason to move it.
+  Setting {
+    id: reverseScroll
+    settingName: "overview-reverse-scroll"
+  }
+
+  // What to multiply a touchpad delta by before it is handed to a scroller.
+  // One place, so the two axes cannot drift apart.
+  readonly property real dragSign: reverseScroll.value ? -1 : 1
+
   // A touchpad delivers pixel deltas tagged with a scroll phase; a mouse
   // wheel delivers angle deltas and no phase at all. They want completely
   // different handling — the first tracks fingers 1:1, the second glides a
@@ -3892,7 +3913,9 @@ Item {
                 // the same thing on its own axis. Two fingers move the strip
                 // of columns, the way niri does and the way the scrolling
                 // layout answers this same gesture with the overview closed.
-                hDrag.dragBy(wheel.pixelDelta.x)
+                // dragSign is the one thing that turns that around, and it
+                // turns both axes around together; see the property.
+                hDrag.dragBy(wheel.pixelDelta.x * root.dragSign)
               }
               wheel.accepted = true
               return
@@ -3913,8 +3936,10 @@ Item {
               // The mouse wheel above stays negated, on both axes, and that
               // is not an inconsistency left lying around: a wheel notch is a
               // request to go somewhere, not a grip on the content, and it
-              // keeps the sense every other wheel on the machine has.
-              vScroll.dragBy(wheel.pixelDelta.y)
+              // keeps the sense every other wheel on the machine has -- which
+              // is also why dragSign, the "reverse scroll direction" setting,
+              // reaches this line and the horizontal one and no others.
+              vScroll.dragBy(wheel.pixelDelta.y * root.dragSign)
             }
             wheel.accepted = true
           }

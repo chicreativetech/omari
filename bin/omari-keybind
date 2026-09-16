@@ -1,0 +1,252 @@
+#!/bin/bash
+# Reads and writes the keys Omari's Hyprland configs bind themselves to.
+#
+#   omari-keybind <overview|alttab> [show|get|default|set <binding>|reset]
+#
+# The bindings live in ~/.config/omari/keybinds.conf as `<name> = <binding>`,
+# and hypr/omari-overview.lua and hypr/omari-alttab.lua read that file
+# themselves on every load. Deliberately a config file the lua reads rather
+# than a rewrite of the lua: the copy in the toggles directory stays byte for
+# byte the file that shipped, whatever the binding is, so changing a key is a
+# `hyprctl reload` and never a re-run of omari-toggle -- and a binding survives
+# the config being switched off and back on.
+#
+# Bindings are normalised before they are stored: modifiers uppercased and put
+# in a fixed order, aliases folded (META/WIN -> SUPER, CONTROL -> CTRL), so the
+# popup shows back the same spelling whatever was typed, and the lua's parser
+# has one shape to read.
+
+set -euo pipefail
+
+usage() {
+  echo "Usage: omari-keybind <overview|alttab> [show|get|default|set <binding>|reset]" >&2
+}
+
+if (($# < 1)); then
+  usage
+  exit 1
+fi
+
+NAME="$1"
+ACTION="${2:-show}"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONFIG_FILE="$CONFIG_HOME/omari/keybinds.conf"
+
+# BASH_SOURCE rather than $0, for the reason omari-toggle gives: this is also
+# run as `bash <path>/omari-keybind` from a plugin directory that may have lost
+# its executable bits.
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# The defaults the lua files fall back to when the config says nothing. Spelled
+# here as well as there because this side has to be able to answer "what is the
+# default" for the popup's Reset, and the lua has to work with this script
+# never having run. Keep the two in step.
+default_for() {
+  case $1 in
+    overview) echo "SUPER + ALT + O" ;;
+    alttab) echo "ALT + TAB" ;;
+  esac
+}
+
+case $NAME in
+  overview | alttab) ;;
+  *)
+    echo "Unknown Omari binding: $NAME" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Modifier order is fixed rather than as-typed: "ALT + SUPER + O" and
+# "SUPER + ALT + O" are the same binding, and storing them as two different
+# strings would make the popup's "this is the default" test miss.
+readonly MOD_ORDER=(SUPER CTRL ALT SHIFT)
+
+# Prints the normalised binding, or explains on stderr why it is not one.
+# A binding needs at least one modifier: both of Omari's are held-modifier
+# shortcuts -- Alt-Tab's switcher literally stays up for as long as its
+# modifier does -- and a bare key would also sit on top of whatever the user
+# types into a window.
+normalize_binding() {
+  local raw="$1"
+  local rest="$raw"
+  local -a mods=()
+  local key=""
+  local token upper m seen
+
+  while [[ -n $rest ]]; do
+    token="${rest%%+*}"
+    if [[ $rest == *+* ]]; then rest="${rest#*+}"; else rest=""; fi
+    token="$(trim "$token")"
+    [[ -z $token ]] && continue
+    upper="${token^^}"
+    case $upper in
+      SUPER | META | WIN | WINDOWS) upper=SUPER ;;
+      CTRL | CONTROL) upper=CTRL ;;
+      ALT | SHIFT) ;;
+      *)
+        if [[ -n $key ]]; then
+          echo "A shortcut can only end in one key: '$raw'." >&2
+          return 1
+        fi
+        # Keysym names, which is what Hyprland's bind parser takes. It looks
+        # them up case-insensitively, so the uppercase stored here is the same
+        # bind as whatever case it was typed in.
+        if [[ ! $upper =~ ^[A-Z0-9_]+$ ]]; then
+          echo "'$token' is not a key name." >&2
+          return 1
+        fi
+        key="$upper"
+        continue
+        ;;
+    esac
+    seen=0
+    for m in ${mods[@]+"${mods[@]}"}; do
+      [[ $m == "$upper" ]] && seen=1
+    done
+    ((seen)) || mods+=("$upper")
+  done
+
+  if [[ -z $key ]]; then
+    echo "A shortcut needs a key, not just modifiers." >&2
+    return 1
+  fi
+  if ((${#mods[@]} == 0)); then
+    echo "A shortcut needs at least one modifier (SUPER, CTRL, ALT or SHIFT)." >&2
+    return 1
+  fi
+
+  local out=""
+  for m in "${MOD_ORDER[@]}"; do
+    for seen in "${mods[@]}"; do
+      [[ $seen == "$m" ]] && out+="$m + "
+    done
+  done
+  printf '%s%s\n' "$out" "$key"
+}
+
+# Last assignment wins, so a file that somehow grew a duplicate reads the same
+# way here as it does in the lua.
+read_config() {
+  [[ -f $CONFIG_FILE ]] || return 0
+  awk -F= -v name="$1" '
+    { sub(/#.*/, "") }
+    NF < 2 { next }
+    {
+      k = $1
+      sub(/^[ \t]+/, "", k); sub(/[ \t]+$/, "", k)
+      if (k != name) next
+      v = substr($0, index($0, "=") + 1)
+      sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+      if (v != "") found = v
+    }
+    END { if (found != "") print found }
+  ' "$CONFIG_FILE"
+}
+
+# Rewrite without the key, then append it -- so unrelated lines, and anything
+# a future version of this file puts there, survive a save.
+write_config() {
+  local name="$1" binding="$2" tmp
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  tmp="$(mktemp "$(dirname "$CONFIG_FILE")/.keybinds.XXXXXX")"
+  if [[ -f $CONFIG_FILE ]]; then
+    awk -F= -v name="$name" '
+      {
+        line = $0
+        probe = $0
+        sub(/#.*/, "", probe)
+        if (index(probe, "=") > 0) {
+          k = substr(probe, 1, index(probe, "=") - 1)
+          sub(/^[ \t]+/, "", k); sub(/[ \t]+$/, "", k)
+          if (k == name) next
+        }
+        print line
+      }
+    ' "$CONFIG_FILE" >"$tmp"
+  else
+    echo "# Omari keybindings. Written by bin/omari-keybind and read by" >"$tmp"
+    echo "# hypr/omari-overview.lua and hypr/omari-alttab.lua on every reload." >>"$tmp"
+  fi
+  [[ -n $binding ]] && echo "$name = $binding" >>"$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$CONFIG_FILE"
+}
+
+# A binding only takes effect on the next reload, and the lua reads the file at
+# load time -- so a reload is nearly the whole of "apply".
+#
+# Nearly, because the lua doing the reading has to be the copy in the toggles
+# directory, and that copy was taken when the switch was last flipped on. An
+# install running since before this plugin learned about keybinds.conf is
+# running a lua that does not read it, and would answer a save by changing
+# nothing at all. `omari-toggle refresh` re-takes the copy, and only if the
+# config is actually on.
+#
+# Hyprland not running is not a reason to call the save failed: the file is
+# already correct and the next reload picks it up. Same contract as
+# omari-toggle.
+reload() {
+  bash "$PLUGIN_DIR/bin/omari-toggle" "$NAME" refresh >/dev/null 2>&1 || true
+  hyprctl reload >/dev/null 2>&1 || echo "Saved, but 'hyprctl reload' failed." >&2
+}
+
+DEFAULT="$(default_for "$NAME")"
+CURRENT="$(read_config "$NAME")"
+# A config left over from an older version, or hand-edited into something the
+# lua cannot parse, would otherwise be shown in the popup as if it worked.
+if [[ -n $CURRENT ]] && ! CURRENT="$(normalize_binding "$CURRENT" 2>/dev/null)"; then
+  CURRENT=""
+fi
+EFFECTIVE="${CURRENT:-$DEFAULT}"
+
+case $ACTION in
+  show)
+    # Two lines rather than one, so the popup learns the current binding and
+    # the default it can reset to in a single process.
+    echo "value = $EFFECTIVE"
+    echo "default = $DEFAULT"
+    ;;
+  get)
+    echo "$EFFECTIVE"
+    ;;
+  default)
+    echo "$DEFAULT"
+    ;;
+  set)
+    if (($# < 3)); then
+      echo "set needs a binding, e.g. omari-keybind overview set 'SUPER + ALT + O'" >&2
+      exit 1
+    fi
+    BINDING="$(normalize_binding "$3")"
+    # Storing a binding that is the default anyway would pin it: a later
+    # release that moves the default would leave this install behind on a value
+    # nobody chose. Dropping the line is how "unset" is spelled.
+    if [[ $BINDING == "$DEFAULT" ]]; then
+      write_config "$NAME" ""
+    else
+      write_config "$NAME" "$BINDING"
+    fi
+    reload
+    echo "value = $BINDING"
+    echo "default = $DEFAULT"
+    ;;
+  reset)
+    write_config "$NAME" ""
+    reload
+    echo "value = $DEFAULT"
+    echo "default = $DEFAULT"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac

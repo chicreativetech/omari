@@ -92,9 +92,49 @@ end
 hl.gesture({ fingers = 4, direction = "up", action = tracker("omari:overview", -1) })
 hl.gesture({ fingers = 4, direction = "down", action = tracker("omari:overview-down", 1) })
 
+-- ------------------------------------------------------- the keyboard bind
+--
 -- Keyboard equivalent of the swipe, for when your hands are on the keys.
 -- Not SUPER+CTRL+O: Omarchy already binds that to "Toggle menu". SUPER+O,
 -- SUPER+SHIFT+O and SUPER+CTRL+O are all taken; SUPER+ALT+O is free and
 -- keeps O for "overview". Lives here rather than in bindings.lua so it
 -- appears and disappears with the overview toggle itself.
-o.bind("SUPER + ALT + O", "Overview", "omarchy-shell shell toggle bergdahlchi.omari")
+--
+-- Which keys, though, is the user's -- the bar popup's Keys tab writes
+-- ~/.config/omari/keybinds.conf and this reads it on every load. Read rather
+-- than substituted in when the config is installed, so the copy in the toggles
+-- directory is byte for byte the file that shipped whatever the binding is:
+-- changing a shortcut is a `hyprctl reload`, never a re-run of omari-toggle,
+-- and a binding outlives the overview being switched off and back on.
+-- See bin/omari-keybind, which owns the file's format and the same default.
+local DEFAULT_BIND = "SUPER + ALT + O"
+
+local function configured_bind(name, fallback)
+  local home = os.getenv("HOME") or ""
+  local config_home = os.getenv("XDG_CONFIG_HOME")
+  if config_home == nil or config_home == "" then
+    config_home = home .. "/.config"
+  end
+
+  local file = io.open(config_home .. "/omari/keybinds.conf", "r")
+  if not file then
+    return fallback
+  end
+
+  -- Last assignment wins, which is what the script writes and what its own
+  -- reader does -- a file that somehow grew a duplicate reads the same on
+  -- both sides.
+  local value
+  for line in file:lines() do
+    local body = line:gsub("#.*", "")
+    local key, raw = body:match("^%s*([%a_]+)%s*=%s*(.-)%s*$")
+    if key == name and raw ~= "" then
+      value = raw
+    end
+  end
+  file:close()
+
+  return value or fallback
+end
+
+o.bind(configured_bind("overview", DEFAULT_BIND), "Overview", "omarchy-shell shell toggle bergdahlchi.omari")
