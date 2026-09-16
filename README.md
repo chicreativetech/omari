@@ -76,6 +76,10 @@ in the bar popup to use its shortcuts.
 | ALT+Tab | Open the window switcher and select the next window (configurable) |
 | ALT+SHIFT+Tab | Open the window switcher and select the previous window |
 
+The arrow keys follow the layout the focused workspace is running. Omarchy's
+SUPER+L still flips a single workspace back to dwindle while Omari mode is on,
+and there they behave exactly as they do in stock Omarchy.
+
 **While the overview is open**
 
 | Shortcut | Action |

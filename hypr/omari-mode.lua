@@ -76,14 +76,52 @@ hl.animation({ leaf = "workspaces", enabled = true, speed = 3, bezier = "easeOut
 -- (or window within a column, for u/d) and brings it into view even when
 -- the current column is maximized, without clearing that column's
 -- maximized state -- the same effect the 3-finger swipe already has.
+--
+-- It is not, however, a message every layout understands, and this mode does
+-- not get the whole session to itself. The layout set above is general:layout,
+-- a *default*; Omarchy's SUPER+L (omarchy-hyprland-workspace-layout-toggle)
+-- writes a per-workspace layout rule, which overrides that default for one
+-- workspace and is restored on every reload from
+-- ~/.local/state/omarchy/workspace-layouts. SUPER+L keeps working while this
+-- mode is on, so a workspace can perfectly well be running dwindle underneath
+-- these bindings -- and dwindle does not implement "focus l". Dispatching it
+-- there does not fall back or no-op, it raises
+--   Unknown dwindle layoutmsg: focus l
+-- out of the dispatcher and into Hyprland's Lua error overlay, once per arrow
+-- press, leaving the arrows dead on that workspace.
+--
+-- So the dispatcher is chosen at press time from the layout the focused
+-- workspace is actually running: the layout-aware "focus" above on a scrolling
+-- workspace, and Omarchy's own movefocus -- the exact binding these replace --
+-- on anything else. Omari mode changes what the arrows do only where its
+-- layout is what is running.
+--
+-- The focused *window's* workspace rather than hl.get_active_workspace(), so a
+-- visible special workspace (SUPER+S scratchpad) is judged by its own layout
+-- instead of the regular workspace sitting behind it; get_active_workspace is
+-- the fallback for a workspace with nothing focused, where either dispatcher
+-- has nothing to move to anyway.
+local function focus_in(direction)
+  return function()
+    local window = hl.get_active_window()
+    local workspace = (window and window.workspace) or hl.get_active_workspace()
+
+    if workspace and workspace.tiled_layout == "scrolling" then
+      hl.dispatch(hl.dsp.layout("focus " .. direction))
+    else
+      hl.dispatch(hl.dsp.focus({ direction = direction }))
+    end
+  end
+end
+
 hl.unbind("SUPER + LEFT")
 hl.unbind("SUPER + RIGHT")
 hl.unbind("SUPER + UP")
 hl.unbind("SUPER + DOWN")
-o.bind("SUPER + LEFT", "Focus on left window", hl.dsp.layout("focus l"))
-o.bind("SUPER + RIGHT", "Focus on right window", hl.dsp.layout("focus r"))
-o.bind("SUPER + UP", "Focus on above window", hl.dsp.layout("focus u"))
-o.bind("SUPER + DOWN", "Focus on below window", hl.dsp.layout("focus d"))
+o.bind("SUPER + LEFT", "Focus on left window", focus_in("l"))
+o.bind("SUPER + RIGHT", "Focus on right window", focus_in("r"))
+o.bind("SUPER + UP", "Focus on above window", focus_in("u"))
+o.bind("SUPER + DOWN", "Focus on below window", focus_in("d"))
 
 -- Workspaces are the vertical axis of this mode: the 3-finger vertical swipe
 -- above switches them, the overview stacks them as rows scrolling down,
