@@ -57,7 +57,7 @@ The bar popup has two tabs. **Info** says what Omari is and carries all three
 switches — **Enable Omari**, the overview, and Alt-Tab — each under the
 sentence describing what it turns on. **Keys** carries the shortcuts, one field
 per feature that is switched on, plus the overview's **Reverse scroll direction
-in overview** switch.
+in overview** switch and the Alt-Tab switcher's **Default scope**.
 
 ### Keyboard shortcuts
 
@@ -104,6 +104,11 @@ Keep `ALT` held while browsing or changing the scope.
 | Release ALT | Activate the selected window |
 | Enter or Space | Activate the selected window immediately |
 | Escape | Cancel without switching windows |
+
+The switcher opens showing all windows. To open it on the current workspace or
+display instead, pick **Keys** > **ALT+TAB** > **Default scope**; `A` / `W` /
+`O` still change the scope once it is open. The choice is stored as
+`alttab-default-scope` in `${XDG_CONFIG_HOME:-$HOME/.config}/omari/settings.conf`.
 
 ### Changing the shortcuts
 

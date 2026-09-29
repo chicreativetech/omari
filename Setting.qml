@@ -31,10 +31,19 @@ Item {
   required property string settingName
 
   // What the setting means with the file saying nothing, which is the state
-  // every install starts in.
-  property bool defaultValue: false
+  // every install starts in. Its type is the setting's type: a bool is an
+  // on/off switch, stored as `on`/`off`; a string is one of `choices`, stored
+  // as itself.
+  property var defaultValue: false
 
-  property bool value: root.defaultValue
+  // The values a string setting may take. A file naming anything else -- a
+  // typo in a hand edit, a value a later version added -- reads as the
+  // default rather than as a state nothing downstream knows how to draw.
+  property var choices: []
+
+  readonly property bool isChoice: typeof root.defaultValue === "string"
+
+  property var value: root.defaultValue
   property bool loaded: false
 
   // Empty while healthy; otherwise why the last save did not land. Only saves
@@ -60,7 +69,7 @@ Item {
   }
 
   function toggle() {
-    root.set(!root.value)
+    if (!root.isChoice) root.set(!root.value)
   }
 
   // Rewrite the file without this key, then append it -- the shape
@@ -77,9 +86,9 @@ Item {
     while (kept.length > 0 && kept[kept.length - 1].trim() === "") kept.pop()
     if (kept.length === 0) {
       kept.push("# Omari settings. Written by the Omari bar popup and read by")
-      kept.push("# the overview. Hand edits are picked up as they are saved.")
+      kept.push("# the overview and Alt-Tab. Hand edits are picked up as they are saved.")
     }
-    kept.push(root.settingName + " = " + (target ? "on" : "off"))
+    kept.push(root.settingName + " = " + (root.isChoice ? String(target) : (target ? "on" : "off")))
     settingsFile.setText(kept.join("\n") + "\n")
   }
 
@@ -107,6 +116,7 @@ Item {
       found = lines[i].substring(at + 1).replace(/#.*/, "").trim().toLowerCase()
     }
     if (found === null) root.value = root.defaultValue
+    else if (root.isChoice) root.value = root.choices.indexOf(found) >= 0 ? found : root.defaultValue
     else root.value = found === "on" || found === "true" || found === "1" || found === "yes"
     root.loaded = true
   }

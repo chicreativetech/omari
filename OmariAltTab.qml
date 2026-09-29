@@ -128,6 +128,17 @@ Item {
 
   // "all" | "workspace" | "output" -- niri's three scopes, on A, W and O.
   property string scope: "all"
+
+  // The scope a session opens in: "Default scope" under the popup's Keys tab,
+  // in ~/.config/omari/settings.conf. Only where a session *starts* -- A, W
+  // and O still move freely once it is up. See Setting.qml.
+  Setting {
+    id: defaultScopeSetting
+    settingName: "alttab-default-scope"
+    defaultValue: "all"
+    choices: ["all", "workspace", "output"]
+  }
+
   property int selected: 0
 
   // The row, snapshotted when the session opens and not rebuilt while it is
@@ -288,20 +299,27 @@ Item {
     root.sessionWorkspaceId = workspace ? Number(workspace.id) : -1
     root.sessionMonitorId = monitor ? Number(monitor.id) : -1
 
-    root.scope = "all"
     root.entries = root.snapshot()
 
-    var list = root.filtered(root.entries, "all")
     // Nothing to switch between is not worth a full-screen overlay. The lua
     // side is told, so its watchdog stops polling for a release that is not
-    // holding anything up.
-    if (list.length === 0) { root.entries = []; root.notifyClosed(); return }
+    // holding anything up. Tested against every window rather than the
+    // default scope: an empty workspace still opens, says so, and is one A
+    // away from the rest of the desktop.
+    if (root.filtered(root.entries, "all").length === 0) {
+      root.entries = []
+      root.notifyClosed()
+      return
+    }
+
+    root.scope = defaultScopeSetting.value
+    var list = root.filtered(root.entries, root.scope)
 
     // Where a switcher starts is the whole convention: one tap of ALT+TAB goes
     // to the window you were on before this one, which is index 1 in a list
     // that starts at the window you are on now. Backwards starts at the end of
     // the row, which is the least recently used window.
-    root.selected = (dir === "prev") ? (list.length - 1) : (list.length > 1 ? 1 : 0)
+    root.selected = (dir === "prev") ? Math.max(0, list.length - 1) : (list.length > 1 ? 1 : 0)
 
     root.targetScreen = root.pickScreen()
     exitFade.stop()

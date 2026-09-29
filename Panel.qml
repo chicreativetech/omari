@@ -17,9 +17,10 @@ import qs.Ui
 // the paragraph, the link, and all three switches -- the mode, the overview,
 // and Alt-Tab -- each under the sentence that says what it turns on. Keys
 // carries the tuning, one section per feature that is switched on: the
-// shortcut it answers to, and under the overview's, which way a two-finger
-// swipe moves it. The split is between reading what a thing is and adjusting
-// how you reach it; whether you want it at all belongs to the first, which is
+// shortcut it answers to, under the overview's, which way a two-finger
+// swipe moves it, and under Alt-Tab's, which scope the switcher opens in.
+// The split is between reading what a thing is and adjusting how you reach
+// it; whether you want it at all belongs to the first, which is
 // the visit that matters most.
 //
 // The overview and Alt-Tab switches are shown only while Omari mode is on, and
@@ -141,6 +142,15 @@ Panel {
   Setting {
     id: reverseScrollSetting
     settingName: "overview-reverse-scroll"
+  }
+
+  // The same file, a string rather than a switch: which of A/W/O the Alt-Tab
+  // switcher is already on when it opens. OmariAltTab.qml watches it.
+  Setting {
+    id: alttabScopeSetting
+    settingName: "alttab-default-scope"
+    defaultValue: "all"
+    choices: ["all", "workspace", "output"]
   }
 
   IpcHandler {
@@ -589,6 +599,40 @@ Panel {
               dim: root.dim
               fontFamily: root.fontFamily
               onExitRequested: keyCatcher.forceActiveFocus()
+            }
+
+            // Here rather than in Info for the reason reverse scroll is: it
+            // tunes how the switcher behaves, not whether you want it.
+            Text {
+              width: parent.width
+              text: "Default scope"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+            }
+
+            ButtonGroup {
+              id: alttabScopeGroup
+              options: [
+                { value: "all", label: "All", tooltip: "Open showing windows from every workspace" },
+                { value: "workspace", label: "Workspace", tooltip: "Open showing only the current workspace's windows" },
+                { value: "output", label: "Output", tooltip: "Open showing only the current monitor's windows" }
+              ]
+              value: alttabScopeSetting.value
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              focusable: false
+              onChanged: function(value) { alttabScopeSetting.set(value) }
+            }
+
+            Text {
+              width: parent.width
+              visible: alttabScopeSetting.error !== ""
+              text: alttabScopeSetting.error
+              wrapMode: Text.WordWrap
+              color: Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
             }
           }
         }
