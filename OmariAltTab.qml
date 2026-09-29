@@ -968,6 +968,11 @@ Item {
                   && card.modelData.toplevel.wayland.title)
                   ? card.modelData.toplevel.wayland.title
                   : card.modelData.title
+                // Plain, never AutoText: a title is whatever the application
+                // says it is -- a browser's is the page's <title> -- and Qt's
+                // markup sniffing would otherwise render one that looks like
+                // HTML, remote <img> fetches included, inside the shell.
+                textFormat: Text.PlainText
                 color: card.current ? Color.foreground : Qt.darker(Color.foreground, 1.6)
                 font.family: Style.font.family
                 font.pixelSize: card.current ? Style.font.subtitle : Style.font.body
